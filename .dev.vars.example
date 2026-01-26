@@ -1,0 +1,7 @@
+# Example environment variables for development
+# Copy this to .dev.vars and fill in your values
+
+# Discord Bot Credentials
+DISCORD_PUBLIC_KEY=your_discord_public_key_here
+DISCORD_BOT_TOKEN=your_discord_bot_token_here
+DISCORD_APPLICATION_ID=your_discord_application_id_here

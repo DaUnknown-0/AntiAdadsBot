@@ -1,0 +1,45 @@
+name = "discord-moderation-bot"
+main = "src/index.ts"
+compatibility_date = "2024-01-10"
+compatibility_flags = ["nodejs_compat"]
+
+# Environment variables are set via wrangler secrets (use `npx wrangler secret put`)
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord-moderation-db"
+database_id = "3d75ce5f-5870-4141-b7ec-b019d03e31b5"  # Created by wrangler d1 create discord-moderation-db
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "7015f5bb2436428db18e660fc8b3ea7b"
+preview_id = "ceb53756d69a47ae9a3e952c3df04f15"
+
+# Durable Objects bindings
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+script_name = "discord-moderation-bot"
+
+[[durable_objects.bindings]]
+name = "SCHEDULED_ACTIONS"
+class_name = "ScheduledActions"
+script_name = "discord-moderation-bot"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter", "ScheduledActions"]
+
+# For development
+[env.dev]
+name = "discord-moderation-bot-dev"
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "discord-moderation-db-dev"
+database_id = ""
+
+# Dev KV namespace binding (create dev KV namespace and set id here):
+# [[env.dev.kv_namespaces]]
+# binding = "CACHE"
+# id = "REPLACE_WITH_DEV_KV_ID"
