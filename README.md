@@ -8,7 +8,7 @@ A multi-server Discord moderation bot running on Cloudflare Workers with Durable
 - � Multi-server support with D1 database
 - 📝 Comprehensive moderation logging and case history
 - 🔨 Global bans across servers: bulk bans (200 users per request) processed by a Durable Object in batches
-- ⏰ Hourly global ban enforcement via a native Cron Trigger
+- ⏰ Optional hourly global ban enforcement per server (`/toggleautoenforce`) via a native Cron Trigger
 - ✅ `/ping` command for quick health checks
 
 ## Setup
@@ -72,14 +72,14 @@ npm run deploy
 ### Durable Objects
 
 - **RateLimiter**: Per-user rate limiting with sliding window algorithm
-- **BanJob**: Runs ban, unban and announcement jobs across many servers. Each alarm run is a fresh
+- **BanJob**: Runs ban, unban, announcement and ban check jobs across many servers. Each alarm run is a fresh
   invocation with its own subrequest budget (50 on the free plan), so large jobs finish completely.
 
 ### Database Schema
 
 - **guild_configs**: Server-specific configuration
 - **moderation_cases**: All moderation actions with case numbers
-- **user_infractions**: User infraction history
+- **user_infractions**: Legacy infraction history (no longer written, saves D1 write quota)
 - **global_ban_list**: One row per globally banned user (source of truth for audits and exports)
 - **global_bans**: Task table behind the `/global-bans` HTTP API
 - **pending_ban_actions**: Confirmation buttons of `/checkbans` and `/auditglobalbans` (1 hour)

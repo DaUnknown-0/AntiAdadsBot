@@ -1,84 +1,90 @@
-import { Env } from '../types/env';
-import { listGuildBanIds, mapWithConcurrency } from './discord';
-import { setGlobalBansDisabled } from './databaseExtras';
+import { appendLimited } from './logging';
 
 /**
- * Compare a list of users against the ban lists of several guilds.
- *
- * Uses GET /guilds/{id}/bans (1000 bans per request), so the cost is one subrequest per guild
- * and page instead of one per user and guild. Guilds that do not fit into `requestBudget`
- * are reported as unchecked instead of blowing the 50-subrequest limit.
+ * Helpers for ban checks (/checkbans, /auditglobalbans and the hourly enforcement).
+ * The checks themselves run page by page inside the BanJob Durable Object.
  */
-export interface MissingBansReport {
-  /** userId -> guilds where the user is NOT banned */
-  missing: Map<string, string[]>;
+
+export type BanCheckVariant = 'checkbans' | 'audit' | 'scheduled';
+
+export interface BanCheckResult {
+  variant: BanCheckVariant;
+  userCount: number;
+  /** Set when /checkbans was limited to one server */
+  singleServer?: string;
   checkedGuilds: string[];
-  /** Guilds that could not be checked (budget exhausted, API error, list too long) */
-  uncheckedGuilds: Array<{ guildId: string; reason: string }>;
   /** Guilds the bot has left; global bans were disabled for them */
   goneGuilds: string[];
-  requestsUsed: number;
+  /** Guilds that could not be checked (API error, ban list too long) */
+  uncheckedGuilds: Array<{ guildId: string; reason: string }>;
+  /** userId -> guilds where the user is NOT banned */
+  missing: Map<string, string[]>;
 }
 
-const MAX_PAGES_PER_GUILD = 5; // 5000 bans per guild
+/**
+ * Build the result message of a ban check, with a confirmation button if bans are missing
+ */
+export function buildBanCheckMessage(
+  result: BanCheckResult,
+  actionId: string | null
+): { message: string; components?: any[] } {
+  const checked = result.checkedGuilds.length;
 
-export async function findMissingBans(
-  env: Env,
-  userIds: string[],
-  guildIds: string[],
-  requestBudget: number
-): Promise<MissingBansReport> {
-  const report: MissingBansReport = {
-    missing: new Map(),
-    checkedGuilds: [],
-    uncheckedGuilds: [],
-    goneGuilds: [],
-    requestsUsed: 0,
+  let message =
+    result.variant === 'audit'
+      ? `**Global Ban Audit Complete**\n\nChecked ${result.userCount} globally banned user(s) across ${checked} server(s).`
+      : `**Ban Status Check Complete**\n\n` +
+        (result.singleServer
+          ? `Checked ${result.userCount} user(s) in server \`${result.singleServer}\`.`
+          : `Checked ${result.userCount} user(s) across ${checked} server(s) with global bans enabled.`);
+
+  if (result.goneGuilds.length > 0) {
+    message += `\n\n⚠️ Bot is no longer in ${result.goneGuilds.length} server(s); global bans were disabled there.`;
+  }
+  if (result.uncheckedGuilds.length > 0) {
+    message += '\n\n**Not checked:**';
+    message = appendLimited(message, result.uncheckedGuilds.map(u => `• Server ID: ${u.guildId} - ${u.reason}`), 1500);
+  }
+
+  if (result.missing.size === 0) {
+    message += `\n\n✅ All users are banned in all checked servers.`;
+    return { message };
+  }
+
+  const lines = [...result.missing.entries()].map(
+    ([userId, guilds]) => `• <@${userId}> (\`${userId}\`): Banned in ${checked - guilds.length}/${checked} servers`
+  );
+  message += `\n\n⚠️ **Users not fully banned (${result.missing.size}):**`;
+  message = appendLimited(message, lines, 3500);
+
+  if (!actionId) {
+    return { message };
+  }
+
+  const users = result.missing.size;
+  const totalMissing = [...result.missing.values()].reduce((sum, guilds) => sum + guilds.length, 0);
+  message += `\n\n**Click the button below to ban these ${users} user(s) in the ${totalMissing} place(s) where they are not banned.**`;
+
+  const audit = result.variant === 'audit';
+  return {
+    message,
+    components: [
+      {
+        type: 1, // Action Row
+        components: [
+          {
+            type: 2, // Button
+            style: 4, // Danger (red)
+            label: (audit
+              ? `Enforce Bans for ${users} User${users > 1 ? 's' : ''}`
+              : `Ban ${users} User${users > 1 ? 's' : ''} (${totalMissing} bans)`).slice(0, 80),
+            custom_id: `${audit ? 'global_ban_' : 'checkban_'}${actionId}`,
+            emoji: { name: '🔨' },
+          },
+        ],
+      },
+    ],
   };
-
-  // Reserve one page per guild up front; pagination beyond that draws from what is left
-  const toCheck = guildIds.slice(0, Math.max(0, requestBudget));
-  for (const guildId of guildIds.slice(toCheck.length)) {
-    report.uncheckedGuilds.push({ guildId, reason: 'Not checked (Cloudflare subrequest limit)' });
-  }
-
-  let spare = requestBudget - toCheck.length;
-
-  const lists = await mapWithConcurrency(toCheck, 6, async (guildId) => {
-    const extraPages = Math.min(MAX_PAGES_PER_GUILD - 1, Math.max(0, spare));
-    const list = await listGuildBanIds(env, guildId, 1 + extraPages);
-    spare -= list.requests - 1;
-    return { guildId, list };
-  });
-
-  for (const { guildId, list } of lists) {
-    report.requestsUsed += list.requests;
-
-    if (list.guildGone) {
-      report.goneGuilds.push(guildId);
-      await setGlobalBansDisabled(env, guildId);
-      continue;
-    }
-    if (list.error) {
-      report.uncheckedGuilds.push({ guildId, reason: list.error });
-      continue;
-    }
-    if (!list.complete) {
-      report.uncheckedGuilds.push({ guildId, reason: 'Ban list too long to check in one run' });
-      continue;
-    }
-
-    report.checkedGuilds.push(guildId);
-    for (const userId of userIds) {
-      if (!list.ids.has(userId)) {
-        const guilds = report.missing.get(userId) || [];
-        guilds.push(guildId);
-        report.missing.set(userId, guilds);
-      }
-    }
-  }
-
-  return report;
 }
 
 /**

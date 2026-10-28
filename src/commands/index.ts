@@ -8,7 +8,7 @@ import { MessageFlags } from '../types/discord';
 import { handlePingCommand } from './info/ping';
 import { handleGlobalBan } from './moderation/globalban';
 import { handleGlobalMassBan } from './moderation/globalmassban';
-import { handleToggleGlobalBan } from './moderation/toggleglobalban';
+import { handleToggleGlobalBan, handleToggleAutoEnforce } from './moderation/toggleglobalban';
 import { handleSetLogChannel } from './moderation/setlogchannel';
 import { handleCheckBans } from './moderation/checkbans';
 import { handleListGlobalBanServers } from './moderation/listglobalbanservers';
@@ -67,6 +67,8 @@ export async function handleCommand(
         return await handleGlobalMassBan(interaction, env, ctx);
       case 'toggleglobalban':
         return await handleToggleGlobalBan(interaction, env, ctx);
+      case 'toggleautoenforce':
+        return await handleToggleAutoEnforce(interaction, env, ctx);
       case 'setlogchannel':
         return await handleSetLogChannel(interaction, env, ctx);
       case 'ping':

@@ -42,6 +42,7 @@ export const COMMAND_PERMISSIONS: Record<string, PermissionLevel> = {
   'globalunban': PermissionLevel.NONE,
   'purgeglobalban': PermissionLevel.NONE,
   'toggleglobalban': PermissionLevel.ADMIN,
+  'toggleautoenforce': PermissionLevel.ADMIN,
   'checkbans': PermissionLevel.NONE,
   'listglobalbanservers': PermissionLevel.NONE,
   'announce': PermissionLevel.NONE,
@@ -266,19 +267,29 @@ export async function updateGuildConfig(
   }
 }
 
-/**
- * Flip the global bans flag for a guild and return the new value (single query)
- */
-export async function toggleGlobalBansEnabled(env: Env, guildId: string): Promise<number> {
-  const row = await env.DB.prepare(
-    `INSERT INTO guild_configs (guild_id, global_bans_enabled) VALUES (?, 1)
-     ON CONFLICT(guild_id) DO UPDATE SET
-       global_bans_enabled = 1 - COALESCE(global_bans_enabled, 0),
-       updated_at = datetime('now')
-     RETURNING global_bans_enabled`
-  ).bind(guildId).first<{ global_bans_enabled: number }>();
+export type GuildFlag = 'global_bans_enabled' | 'auto_enforce_enabled';
 
-  return row?.global_bans_enabled ?? 0;
+/**
+ * Flip an on/off flag of a guild and return both flags afterwards (single query)
+ */
+export async function toggleGuildFlag(
+  env: Env,
+  guildId: string,
+  flag: GuildFlag
+): Promise<{ global_bans_enabled: number; auto_enforce_enabled: number }> {
+  // `flag` comes from the GuildFlag union above, never from user input
+  const row = await env.DB.prepare(
+    `INSERT INTO guild_configs (guild_id, ${flag}) VALUES (?, 1)
+     ON CONFLICT(guild_id) DO UPDATE SET
+       ${flag} = 1 - COALESCE(${flag}, 0),
+       updated_at = datetime('now')
+     RETURNING global_bans_enabled, auto_enforce_enabled`
+  ).bind(guildId).first<{ global_bans_enabled: number | null; auto_enforce_enabled: number | null }>();
+
+  return {
+    global_bans_enabled: row?.global_bans_enabled ?? 0,
+    auto_enforce_enabled: row?.auto_enforce_enabled ?? 0,
+  };
 }
 
 /**

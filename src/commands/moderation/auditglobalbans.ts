@@ -1,15 +1,11 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType } from '../../types/discord';
 import { editOriginalResponse } from '../../utils/discord';
-import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
+import { createSuccessEmbed } from '../../utils/logging';
 import { getGuildsWithGlobalBansEnabled, getGlobalBanList } from '../../utils/databaseExtras';
-import { findMissingBans } from '../../utils/banCheck';
 import { getInvokingUserId } from '../../utils/permissions';
+import { startBanJob } from '../../durable-objects/BanJob';
 import { rejectUnlessSpecialUser, replyError } from './globalBanShared';
-import { buildMissingBansReply } from './checkbans';
-
-// Subrequests left for ban list pages after the D1 queries and the reply
-const BAN_LIST_REQUEST_BUDGET = 42;
 
 export async function handleAuditGlobalBans(
   interaction: DiscordInteraction,
@@ -19,7 +15,7 @@ export async function handleAuditGlobalBans(
   const rejection = rejectUnlessSpecialUser(env, interaction);
   if (rejection) return rejection;
 
-  // Return deferred response immediately
+  // Return deferred response immediately; the BanJob reads the ban lists and edits this response
   ctx.waitUntil(
     (async () => {
       try {
@@ -40,23 +36,17 @@ export async function handleAuditGlobalBans(
           return;
         }
 
-        // The number of banned users no longer matters: one request per server and 1000 bans
-        const report = await findMissingBans(env, globalBans.map(b => b.user_id), guilds, BAN_LIST_REQUEST_BUDGET);
-
-        const header =
-          `**Global Ban Audit Complete**\n\n` +
-          `Checked ${globalBans.length} globally banned user(s) across ${report.checkedGuilds.length} server(s).`;
-
-        const { message, components } = await buildMissingBansReply(env, report, header, {
+        // Ban lists are read page by page across alarm runs, so neither the number of
+        // banned users nor the number of servers is limited by the 50-subrequest budget
+        await startBanJob(env, {
+          kind: 'check',
+          title: 'Global ban audit',
+          targets: guilds.map(guildId => ({ guildId, userIds: [] })),
           reason: 'Global ban enforcement from audit',
-          requestedBy: getInvokingUserId(interaction),
-          buttonPrefix: 'global_ban_',
-          buttonLabel: (users) => `Enforce Bans for ${users} User${users > 1 ? 's' : ''}`,
-        });
-
-        await editOriginalResponse(interaction.application_id, interaction.token, {
-          embeds: [report.missing.size === 0 ? createSuccessEmbed(message) : createErrorEmbed(message)],
-          components,
+          deleteMessageSeconds: 0,
+          moderatorId: getInvokingUserId(interaction),
+          check: { userIds: globalBans.map(b => b.user_id), variant: 'audit', onComplete: 'report' },
+          interaction: { applicationId: interaction.application_id, token: interaction.token },
         });
       } catch (error) {
         console.error('Error during global ban audit:', error);

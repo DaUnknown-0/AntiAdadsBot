@@ -5,40 +5,54 @@ import {
   BULK_BAN_MAX_USERS,
   bulkBanUsers,
   editOriginalResponse,
+  fetchGuildBanPage,
   isSubrequestLimitError,
   mapWithConcurrency,
   sendMessage,
   unbanUser,
 } from '../utils/discord';
 import { createModerationCases } from '../utils/database';
-import { getGlobalBanGuildTargets, setGlobalBansDisabled } from '../utils/databaseExtras';
+import { createPendingBanAction, getGlobalBanGuildTargets, setGlobalBansDisabled } from '../utils/databaseExtras';
+import { BanCheckVariant, buildBanCheckMessage } from '../utils/banCheck';
 import { createErrorEmbed, createInfoEmbed, createSuccessEmbed, logBulkModerationAction } from '../utils/logging';
 
 /**
  * BanJob Durable Object
  *
- * Runs ban, unban and announcement jobs across many guilds. A Worker invocation on the free
- * plan may only make 50 subrequests and `waitUntil` ends 30s after the response, so long jobs
- * used to stop halfway. Here every alarm is a fresh invocation with its own budget: each run
- * processes as many guilds as fit, saves its progress and schedules the next run.
+ * Runs ban, unban, announcement and ban check jobs across many guilds. A Worker invocation on
+ * the free plan may only make 50 subrequests and `waitUntil` ends 30s after the response, so
+ * long jobs used to stop halfway. Here every alarm is a fresh invocation with its own budget:
+ * each run processes as much as fits, saves its progress and schedules the next run.
  *
  * One instance per job (newUniqueId), deleted when the job is done.
  */
 
-export type BanJobKind = 'ban' | 'unban' | 'announce';
+export type BanJobKind = 'ban' | 'unban' | 'announce' | 'check';
+
+export interface BanCheckInput {
+  /** Users that should be banned in every target guild */
+  userIds: string[];
+  variant: BanCheckVariant;
+  /** report: show the result with a confirmation button; enforce: ban the missing users right away */
+  onComplete: 'report' | 'enforce';
+  /** Set when /checkbans was limited to one server */
+  singleServer?: string;
+}
 
 export interface BanJobInput {
   kind: BanJobKind;
   /** Shown in the progress and result messages, e.g. "Global mass ban" */
   title: string;
-  /** Users to process per guild (ignored for announcements) */
+  /** Users to process per guild (ignored for announcements and checks) */
   targets: Array<{ guildId: string; userIds: string[] }>;
+  /** Ban/unban reason; for checks the reason stored with the confirmation button */
   reason: string;
   deleteMessageSeconds: number;
   moderatorId: string;
   /** Extra lines shown above the results */
   notes?: string[];
   announcement?: DiscordEmbed;
+  check?: BanCheckInput;
   /** Interaction whose original response shows progress and results (omit for cron jobs) */
   interaction?: { applicationId: string; token: string };
 }
@@ -47,6 +61,9 @@ interface WorkItem {
   guildId: string;
   userIds: string[];
   attempts: number;
+  /** Ban list pagination cursor (checks only) */
+  after?: string;
+  pages?: number;
 }
 
 interface GuildOutcome {
@@ -56,8 +73,19 @@ interface GuildOutcome {
   error?: string;
 }
 
+interface CheckState {
+  variant: BanCheckVariant;
+  onComplete: 'report' | 'enforce';
+  singleServer?: string;
+  userCount: number;
+  checked: string[];
+  gone: string[];
+  unchecked: Array<{ guildId: string; reason: string }>;
+}
+
 interface JobState {
-  input: Omit<BanJobInput, 'targets'>;
+  input: Omit<BanJobInput, 'targets' | 'check'>;
+  check?: CheckState;
   queue: WorkItem[];
   totalItems: number;
   totalGuilds: number;
@@ -70,12 +98,14 @@ interface JobState {
 
 // Subrequests (fetch + D1) one alarm run may use; the hard limit is 50
 const RUN_BUDGET = 40;
-// Reserved for the progress/result edit and the one-time log channel lookup
+// Reserved for the progress/result edit plus one D1 query (log channels or confirmation button)
 const RUN_RESERVED = 2;
 const CONCURRENCY = 6;
 const UNBAN_USERS_PER_ITEM = 10;
 const MAX_ITEM_ATTEMPTS = 3;
 const MAX_FAILED_RUNS = 5;
+// 50 pages of 1000 bans; larger ban lists are reported as not checked
+const MAX_CHECK_PAGES = 50;
 // Give Discord time to register the deferred response before the first edit
 const FIRST_RUN_DELAY_MS = 1500;
 const NEXT_RUN_DELAY_MS = 1000;
@@ -83,14 +113,19 @@ const NEXT_RUN_DELAY_MS = 1000;
 const INTERACTION_TOKEN_TTL_MS = 14 * 60 * 1000;
 
 const GUILD_GONE_ERROR = 'Bot not in server (global bans auto-disabled)';
+const CHECK_TARGETS_KEY = 'check:targets';
+const missingKey = (guildId: string) => `check:missing:${guildId}`;
 
 export class BanJob extends DurableObject<Env> {
+  /** Users a check compares against, loaded once per alarm run */
+  private checkTargets: string[] | null = null;
+
   async start(input: BanJobInput): Promise<void> {
     const queue: WorkItem[] = [];
     const chunkSize = input.kind === 'unban' ? UNBAN_USERS_PER_ITEM : BULK_BAN_MAX_USERS;
 
     for (const target of input.targets) {
-      if (input.kind === 'announce') {
+      if (input.kind === 'announce' || input.kind === 'check') {
         queue.push({ guildId: target.guildId, userIds: [], attempts: 0 });
         continue;
       }
@@ -99,7 +134,7 @@ export class BanJob extends DurableObject<Env> {
       }
     }
 
-    const { targets, ...rest } = input;
+    const { targets, check, ...rest } = input;
     const state: JobState = {
       input: rest,
       queue,
@@ -111,6 +146,21 @@ export class BanJob extends DurableObject<Env> {
       runs: 0,
       failedRuns: 0,
     };
+
+    if (input.kind === 'check') {
+      if (!check) throw new Error('A check job needs check options');
+      state.check = {
+        variant: check.variant,
+        onComplete: check.onComplete,
+        singleServer: check.singleServer,
+        userCount: check.userIds.length,
+        checked: [],
+        gone: [],
+        unchecked: [],
+      };
+      // Kept apart from the state so the per-run state write stays small
+      await this.ctx.storage.put(CHECK_TARGETS_KEY, check.userIds);
+    }
 
     await this.ctx.storage.put('state', state);
     await this.ctx.storage.setAlarm(Date.now() + FIRST_RUN_DELAY_MS);
@@ -127,13 +177,17 @@ export class BanJob extends DurableObject<Env> {
 
       if (state.logChannels === null) {
         state.logChannels = {};
-        if (state.input.kind !== 'unban') {
+        if (state.input.kind === 'ban' || state.input.kind === 'announce') {
           const guildIds = [...new Set(state.queue.map(item => item.guildId))];
           for (const t of await getGlobalBanGuildTargets(this.env, guildIds)) {
             state.logChannels[t.guildId] = t.logChannelId;
           }
           budget--;
         }
+      }
+
+      if (state.input.kind === 'check') {
+        this.checkTargets = (await this.ctx.storage.get<string[]>(CHECK_TARGETS_KEY)) || [];
       }
 
       // Take items from the front of the queue while they fit into this run's budget
@@ -147,8 +201,8 @@ export class BanJob extends DurableObject<Env> {
 
       const requeue: WorkItem[] = [];
       await mapWithConcurrency(batch, CONCURRENCY, async (item) => {
-        const retry = await this.processItem(state, item);
-        if (retry) requeue.push(item);
+        const again = await this.processItem(state, item);
+        if (again) requeue.push(item);
       });
       state.queue.unshift(...requeue);
 
@@ -159,7 +213,11 @@ export class BanJob extends DurableObject<Env> {
         return;
       }
 
-      await this.finish(state);
+      if (state.input.kind === 'check') {
+        await this.finishCheck(state);
+      } else {
+        await this.finish(state);
+      }
     } catch (error) {
       console.error(`BanJob run ${state.runs} failed:`, error);
       state.failedRuns++;
@@ -178,11 +236,12 @@ export class BanJob extends DurableObject<Env> {
     const hasLog = !!state.logChannels?.[item.guildId];
     switch (state.input.kind) {
       case 'ban':
-        // bulk-ban + case batch + log message
+        // bulk-ban + case insert + log message
         return 2 + (hasLog ? 1 : 0);
       case 'unban':
         return item.userIds.length;
       case 'announce':
+      case 'check':
         return 1;
     }
   }
@@ -192,14 +251,18 @@ export class BanJob extends DurableObject<Env> {
   }
 
   /**
-   * Process one work item. Returns true if it should be retried in the next run
-   * (only when the subrequest limit was hit before anything was changed).
+   * Process one work item. Returns true if it should run again in the next run: after hitting
+   * the subrequest limit before anything was changed, or to read the next page of a ban list.
    */
   private async processItem(state: JobState, item: WorkItem): Promise<boolean> {
     const outcome = this.outcome(state, item.guildId);
     const { input } = state;
 
     try {
+      if (input.kind === 'check') {
+        return await this.processCheckItem(state, item);
+      }
+
       if (input.kind === 'ban') {
         const result = await bulkBanUsers(this.env, item.guildId, item.userIds, input.reason, input.deleteMessageSeconds);
 
@@ -283,10 +346,60 @@ export class BanJob extends DurableObject<Env> {
       if (isSubrequestLimitError(error) && ++item.attempts < MAX_ITEM_ATTEMPTS) {
         return true;
       }
+      if (input.kind === 'check') {
+        state.check!.unchecked.push({ guildId: item.guildId, reason: String((error as any)?.message || error) });
+        await this.ctx.storage.delete(missingKey(item.guildId));
+        return false;
+      }
       outcome.error = String((error as any)?.message || error);
       if (input.kind !== 'announce') outcome.failedUserIds.push(...item.userIds);
       return false;
     }
+  }
+
+  /**
+   * Read one page of a guild's ban list and drop every target user found on it.
+   * What is left after the last page are the users missing a ban in that guild.
+   */
+  private async processCheckItem(state: JobState, item: WorkItem): Promise<boolean> {
+    const check = state.check!;
+    const key = missingKey(item.guildId);
+    const page = await fetchGuildBanPage(this.env, item.guildId, item.after);
+
+    if (page.guildGone) {
+      check.gone.push(item.guildId);
+      await setGlobalBansDisabled(this.env, item.guildId);
+      await this.ctx.storage.delete(key);
+      return false;
+    }
+    if (page.error) {
+      check.unchecked.push({ guildId: item.guildId, reason: page.error });
+      await this.ctx.storage.delete(key);
+      return false;
+    }
+
+    const remaining = (await this.ctx.storage.get<string[]>(key)) || this.checkTargets || [];
+    const banned = new Set(page.ids);
+    const stillMissing = remaining.filter(userId => !banned.has(userId));
+    item.pages = (item.pages || 0) + 1;
+
+    // Done after the last page, or early once every target user was found
+    if (page.done || stillMissing.length === 0) {
+      check.checked.push(item.guildId);
+      if (stillMissing.length > 0) await this.ctx.storage.put(key, stillMissing);
+      else await this.ctx.storage.delete(key);
+      return false;
+    }
+
+    if (item.pages >= MAX_CHECK_PAGES) {
+      check.unchecked.push({ guildId: item.guildId, reason: `Ban list too long (over ${MAX_CHECK_PAGES * 1000} bans)` });
+      await this.ctx.storage.delete(key);
+      return false;
+    }
+
+    await this.ctx.storage.put(key, stillMissing);
+    item.after = page.lastId;
+    return true;
   }
 
   private canUseInteraction(state: JobState): boolean {
@@ -295,12 +408,87 @@ export class BanJob extends DurableObject<Env> {
 
   private async reportProgress(state: JobState): Promise<void> {
     if (!this.canUseInteraction(state)) return;
-    const done = state.totalItems - state.queue.length;
+
+    const text = state.check
+      ? `${state.input.title}: ${state.check.checked.length + state.check.gone.length + state.check.unchecked.length}/${state.totalGuilds} servers checked...`
+      : `${state.input.title}: ${state.totalItems - state.queue.length}/${state.totalItems} batches processed...`;
+
     const { applicationId, token } = state.input.interaction!;
     await editOriginalResponse(applicationId, token, {
-      embeds: [createInfoEmbed('🔄 In progress', `${state.input.title}: ${done}/${state.totalItems} batches processed...`)],
+      embeds: [createInfoEmbed('🔄 In progress', text)],
       components: [],
     }).catch(err => console.error('Progress update failed:', err));
+  }
+
+  /**
+   * End of a check: either report the result with a confirmation button,
+   * or (hourly enforcement) turn this job into a ban job for the missing bans.
+   */
+  private async finishCheck(state: JobState): Promise<void> {
+    const check = state.check!;
+
+    const missingByGuild = new Map<string, string[]>();
+    for (const guildId of check.checked) {
+      const missing = await this.ctx.storage.get<string[]>(missingKey(guildId));
+      if (missing?.length) missingByGuild.set(guildId, missing);
+    }
+
+    const summary =
+      `Checked ${check.userCount} user(s) across ${check.checked.length} server(s); ` +
+      `${check.unchecked.length} not checked, ${check.gone.length} left.`;
+
+    if (check.onComplete === 'enforce') {
+      const missingCount = [...missingByGuild.values()].reduce((sum, users) => sum + users.length, 0);
+      console.log(`${state.input.title}: ${summary} ${missingCount} missing bans.`);
+
+      await this.ctx.storage.deleteAll();
+      if (missingCount === 0) return;
+
+      await this.start({
+        ...state.input,
+        kind: 'ban',
+        targets: [...missingByGuild.entries()].map(([guildId, userIds]) => ({ guildId, userIds })),
+        notes: [summary],
+      });
+      return;
+    }
+
+    const missingByUser = new Map<string, string[]>();
+    for (const [guildId, userIds] of missingByGuild) {
+      for (const userId of userIds) {
+        const guilds = missingByUser.get(userId) || [];
+        guilds.push(guildId);
+        missingByUser.set(userId, guilds);
+      }
+    }
+
+    const actionId = missingByUser.size > 0
+      ? await createPendingBanAction(this.env, Object.fromEntries(missingByUser), state.input.reason, state.input.moderatorId)
+      : null;
+
+    const { message, components } = buildBanCheckMessage(
+      {
+        variant: check.variant,
+        userCount: check.userCount,
+        singleServer: check.singleServer,
+        checkedGuilds: check.checked,
+        goneGuilds: check.gone,
+        uncheckedGuilds: check.unchecked,
+        missing: missingByUser,
+      },
+      actionId
+    );
+
+    if (this.canUseInteraction(state)) {
+      const { applicationId, token } = state.input.interaction!;
+      const warn = check.variant === 'audit' && missingByUser.size > 0;
+      await editOriginalResponse(applicationId, token, {
+        embeds: [warn ? createErrorEmbed(message) : createSuccessEmbed(message)],
+        components,
+      }).catch(err => console.error('Result update failed:', err));
+    }
+
+    await this.ctx.storage.deleteAll();
   }
 
   private async finish(state: JobState, abortReason?: string): Promise<void> {
@@ -330,8 +518,10 @@ export class BanJob extends DurableObject<Env> {
       message = `**${input.title} complete.** Successes: ${succeeded}, Failures: ${failed}`;
     } else if (input.kind === 'unban') {
       message = `**${input.title} complete.** Unbanned in ${succeeded} server(s), not banned in ${skipped}, failed in ${failed}`;
-    } else {
+    } else if (input.kind === 'announce') {
       message = `**${input.title} complete.** Sent to ${succeeded} out of ${state.totalGuilds} server(s).`;
+    } else {
+      message = `**${input.title} stopped.**`;
     }
 
     if (abortReason) message += `\n\n⚠️ ${abortReason}`;

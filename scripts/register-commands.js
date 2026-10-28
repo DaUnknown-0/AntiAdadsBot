@@ -103,6 +103,10 @@ const commands = [
     description: 'Toggle global bans for this server (default false)'
   },
   {
+    name: 'toggleautoenforce',
+    description: 'Toggle hourly automatic re-ban of globally banned users for this server (default false)'
+  },
+  {
     name: 'setlogchannel',
     description: 'Set or clear the moderation log channel for this server',
     options: [

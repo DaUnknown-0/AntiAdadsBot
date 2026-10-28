@@ -7,8 +7,7 @@ import { handleCommand } from './commands';
 import { handleButtonInteraction } from './commands/moderation/handleButtonInteraction';
 import { JsonResponse, ErrorResponse } from './utils/responses';
 import { getInvokingUserId, isSpecialUser } from './utils/permissions';
-import { addToGlobalBanListStatement, getGlobalBanList, getGuildsWithGlobalBansEnabled } from './utils/databaseExtras';
-import { findMissingBans, invertMissingBans } from './utils/banCheck';
+import { addToGlobalBanListStatement, getGlobalBanList, getGuildsWithAutoEnforceEnabled } from './utils/databaseExtras';
 
 // Export Durable Object classes
 export { RateLimiter, BanJob };
@@ -245,43 +244,33 @@ async function handleScheduledGlobalBanCheck(
 }
 
 /**
- * Make sure everyone on the global ban list is banned in every enabled server.
- * Reads each server's ban list (one request per 1000 bans) and hands only the missing
- * bans to a BanJob, so the run stays far below the 50-subrequest limit.
+ * Make sure everyone on the global ban list is banned in every server that opted into
+ * automatic enforcement (/toggleautoenforce, off by default). A BanJob reads the ban lists
+ * page by page and then bans only where a ban is missing.
  */
 async function enforceGlobalBans(env: Env): Promise<void> {
   try {
     const [globalBans, guilds] = await Promise.all([
       getGlobalBanList(env),
-      getGuildsWithGlobalBansEnabled(env),
+      getGuildsWithAutoEnforceEnabled(env),
       // Housekeeping: buttons older than an hour can no longer be used
       env.DB.prepare("DELETE FROM pending_ban_actions WHERE expires_at <= datetime('now')").run(),
     ]);
 
     if (globalBans.length === 0 || guilds.length === 0) {
-      console.log(`Global ban check skipped: ${globalBans.length} banned users, ${guilds.length} servers`);
+      console.log(`Global ban enforcement skipped: ${globalBans.length} banned users, ${guilds.length} servers with auto-enforce`);
       return;
     }
 
-    const report = await findMissingBans(env, globalBans.map(b => b.user_id), guilds, 44);
-    const missingCount = [...report.missing.values()].reduce((sum, g) => sum + g.length, 0);
-
-    console.log(
-      `Checked ${globalBans.length} globally banned users across ${report.checkedGuilds.length} servers: ` +
-      `${missingCount} missing bans, ${report.uncheckedGuilds.length} servers not checked, ${report.goneGuilds.length} servers left`
-    );
-
-    if (missingCount === 0) return;
-
-    const byGuild = invertMissingBans(Object.fromEntries(report.missing));
     await startBanJob(env, {
-      kind: 'ban',
+      kind: 'check',
       title: 'Scheduled global ban enforcement',
-      targets: [...byGuild.entries()].map(([guildId, userIds]) => ({ guildId, userIds })),
+      targets: guilds.map(guildId => ({ guildId, userIds: [] })),
       reason: 'Global ban enforcement',
       deleteMessageSeconds: 0,
       // A bot's user ID equals its application ID
       moderatorId: env.DISCORD_APPLICATION_ID,
+      check: { userIds: globalBans.map(b => b.user_id), variant: 'scheduled', onComplete: 'enforce' },
     });
   } catch (error) {
     console.error('Error during scheduled global ban check:', error);

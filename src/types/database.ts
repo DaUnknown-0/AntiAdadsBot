@@ -17,6 +17,7 @@ export interface GuildConfig {
   leave_message?: string;
   leave_channel_id?: string;
   global_bans_enabled?: number;
+  auto_enforce_enabled?: number; // hourly automatic re-ban of global ban list users (opt-in)
   command_permissions?: string; // JSON mapping of command -> required PermissionLevel (number)
   created_at: string;
   updated_at: string;

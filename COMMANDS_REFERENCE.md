@@ -92,7 +92,9 @@ Returns:
 - List of users not fully banned (with ban counts)
 - **⚠️ Button to enforce the missing bans** (only where a ban is actually missing)
 
-The same check runs automatically every hour (Cron Trigger) and enforces missing bans on its own.
+The check runs in the background in batches, so neither the number of banned users nor the number of
+servers is limited. The same check runs every hour (Cron Trigger) and bans automatically, but only in
+servers that enabled `/toggleautoenforce`.
 
 ### Server Administration (Admin Only)
 
@@ -105,6 +107,18 @@ Enable or disable global bans for your server.
 Toggles between:
 - **Enabled**: Server participates in global bans
 - **Disabled**: Server is excluded from global ban system
+
+#### `/toggleautoenforce`
+Enable or disable the hourly automatic re-ban for your server (default: disabled).
+```
+/toggleautoenforce
+```
+
+- **Enabled**: Every hour the bot bans users from the global ban list who are not banned here,
+  including users a moderator unbanned locally
+- **Disabled**: Missing bans are only applied after confirming `/auditglobalbans` or `/checkbans`
+
+Only has an effect while global bans are enabled for the server.
 
 #### `/setlogchannel`
 Configure where moderation logs are sent.
@@ -139,6 +153,7 @@ Users listed in `SPECIAL_USER_IDS` environment variable. Can use:
 ### Admins
 Users with Administrator permission or admin roles. Can use:
 - `/toggleglobalban`
+- `/toggleautoenforce`
 - `/setlogchannel`
 - All Special User commands
 
@@ -218,8 +233,8 @@ Use this regularly to ensure global bans are properly enforced!
 - **Global bans**: one bulk ban request per server and 200 users (`POST /guilds/{id}/bulk-ban`)
 - **Large jobs**: processed by the BanJob Durable Object in runs of ~40 subrequests; the original
   message shows progress and is replaced by the result
-- **Ban checks**: one request per server and 1000 bans; servers that do not fit into one run are
-  listed as "Not checked"
+- **Ban checks**: one request per server and 1000 bans, read page by page across batches
+  (no limit on servers; ban lists over 50,000 entries are listed as "Not checked")
 - **Discord API**: 429 responses are retried automatically
 - **Commands**: Rate limited per user/guild via Durable Objects (special users are exempt)
 
@@ -235,7 +250,7 @@ Common error messages:
 | "Bot not in server" | Bot removed from server | Bot auto-disables global bans for that server |
 | "Missing permissions" | Bot lacks Ban Members or Manage Server | Grant both permissions (bulk ban needs both) |
 | "Not banned (already banned, ...)" | User was already banned or outranks the bot | Usually nothing to do |
-| "Not checked (Cloudflare subrequest limit)" | Too many servers for one run | Run the check again or wait for the hourly run |
+| "Ban list too long (over 50000 bans)" | Server has an extremely long ban list | Check that server with `/checkbans server:<id>` |
 
 ## Best Practices
 
@@ -268,7 +283,7 @@ Accepted task statuses for `POST /global-bans/{id}/result`: `pending`, `processi
 A `completed` task adds the user to the global ban list.
 
 ### Trigger Scheduled Check
-Runs automatically every hour; trigger it manually with:
+Runs automatically every hour for servers with `/toggleautoenforce` enabled; trigger it manually with:
 ```bash
 curl -X POST https://your-worker.workers.dev/scheduled/check-global-bans \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"

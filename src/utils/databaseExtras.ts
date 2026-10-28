@@ -9,6 +9,17 @@ export async function getGuildsWithGlobalBansEnabled(env: Env): Promise<string[]
 }
 
 /**
+ * Guilds that take part in global bans AND opted into the hourly automatic re-ban
+ */
+export async function getGuildsWithAutoEnforceEnabled(env: Env): Promise<string[]> {
+  const results = await env.DB.prepare(
+    'SELECT guild_id FROM guild_configs WHERE global_bans_enabled = 1 AND auto_enforce_enabled = 1'
+  ).all<{ guild_id: string }>();
+
+  return (results.results || []).map(r => r.guild_id);
+}
+
+/**
  * Guilds with global bans enabled, together with their log channel (one query for both)
  */
 export async function getGlobalBanGuildTargets(

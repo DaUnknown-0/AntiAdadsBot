@@ -675,54 +675,34 @@ export async function bulkBanUsers(
   return { banned: [], failed: [...userIds], guildGone: false, error: describeDiscordError(err) };
 }
 
-export interface GuildBanList {
-  ids: Set<string>;
+export interface GuildBanPage {
+  ids: string[];
+  /** Pass as `after` to fetch the next page */
+  lastId?: string;
+  /** true when this was the last page */
+  done: boolean;
   guildGone: boolean;
-  /** false if the page limit was reached before the end of the list */
-  complete: boolean;
-  /** Number of API requests used (each page is one subrequest) */
-  requests: number;
   error?: string;
 }
 
 /**
- * Fetch all banned user IDs of a guild, 1000 per request.
- * One request per guild replaces one request per user and guild.
+ * Fetch one page (up to 1000) of a guild's banned user IDs.
+ * Reading the ban list costs one request per 1000 bans instead of one per user and guild.
  */
-export async function listGuildBanIds(
-  env: Env,
-  guildId: string,
-  maxPages: number
-): Promise<GuildBanList> {
-  const ids = new Set<string>();
-  let after: string | undefined;
-  let requests = 0;
+export async function fetchGuildBanPage(env: Env, guildId: string, after?: string): Promise<GuildBanPage> {
+  // An explicit `after` (0 for the first page) makes Discord sort ascending by user ID
+  const response = await discordRequestWithRetry(env, `/guilds/${guildId}/bans?limit=1000&after=${after || '0'}`, {}, 2);
 
-  while (requests < maxPages) {
-    const query = `limit=1000${after ? `&after=${after}` : ''}`;
-    const response = await discordRequestWithRetry(env, `/guilds/${guildId}/bans?${query}`, {}, 2);
-    requests++;
-
-    if (!response.ok) {
-      const err = await readDiscordError(response);
-      const gone = isGuildGoneError(err);
-      return { ids, guildGone: gone, complete: false, requests, error: gone ? undefined : describeDiscordError(err) };
-    }
-
-    const page = (await response.json()) as Array<{ user: { id: string } }>;
-    for (const ban of page) {
-      ids.add(ban.user.id);
-    }
-
-    if (page.length < 1000) {
-      return { ids, guildGone: false, complete: true, requests };
-    }
-
-    // Bans are returned in ascending user ID order when paginating with `after`
-    after = page[page.length - 1].user.id;
+  if (!response.ok) {
+    const err = await readDiscordError(response);
+    const gone = isGuildGoneError(err);
+    return { ids: [], done: true, guildGone: gone, error: gone ? undefined : describeDiscordError(err) };
   }
 
-  return { ids, guildGone: false, complete: false, requests };
+  const page = (await response.json()) as Array<{ user: { id: string } }>;
+  const ids = page.map(ban => ban.user.id);
+
+  return { ids, lastId: ids[ids.length - 1], done: ids.length < 1000, guildGone: false };
 }
 
 /**
