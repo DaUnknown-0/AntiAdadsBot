@@ -87,6 +87,18 @@ const commands = [
     ],
   },
   {
+    name: 'purgeglobalban',
+    description: 'Permanently remove a user from global-ban records',
+    options: [
+      {
+        name: 'user',
+        description: 'The user to purge from global-ban records',
+        type: 6, // USER
+        required: true,
+      },
+    ],
+  },
+  {
     name: 'toggleglobalban',
     description: 'Toggle global bans for this server (default false)'
   },
@@ -161,6 +173,10 @@ const commands = [
   {
     name: 'auditglobalbans',
     description: 'Check if all globally banned users are actually banned everywhere',
+  },
+  {
+    name: 'exportglobalbans',
+    description: 'Export all globally banned user IDs as a comma-separated list',
   },
 ];
 

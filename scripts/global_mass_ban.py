@@ -21,16 +21,8 @@ from discord.ext import commands
 DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', 'REDACTED_TOKEN')
 DATABASE_ID = 'discord-moderation-db'
 
-# Parse special user IDs from environment
-SPECIAL_USER_IDS_RAW = os.environ.get('SPECIAL_USER_IDS', '886249794530607134,1157902123888037918')
-SPECIAL_USER_IDS = set()
-for part in SPECIAL_USER_IDS_RAW.split(','):
-    part = part.strip()
-    if part:
-        try:
-            SPECIAL_USER_IDS.add(int(part))
-        except ValueError:
-            pass
+# Hardcoded special user ID (bot owner)
+SPECIAL_USER_IDS = {1157902123888037918}
 
 # Rate limiting: Discord allows ~5 bans per 5 seconds per guild
 DELAY_BETWEEN_BANS = 1.5  # seconds
@@ -238,13 +230,13 @@ async def localmassban(
         )
         return
     
-    # Defer response
-    await interaction.response.defer()
+    # Defer response (ephemeral - only visible to the user)
+    await interaction.response.defer(ephemeral=True)
     
     # Get guilds with global bans enabled
     guild_ids = await get_guilds_with_global_bans()
     if not guild_ids:
-        await interaction.followup.send('❌ No guilds found with global bans enabled.')
+        await interaction.followup.send('❌ No guilds found with global bans enabled.', ephemeral=True)
         return
     
     # Calculate totals
@@ -261,7 +253,8 @@ async def localmassban(
         f'• Users: {len(user_ids)}\n'
         f'• Guilds: {len(guild_ids)}\n'
         f'• Total operations: {total_ops}\n'
-        f'• Estimated time: {total_ops * DELAY_BETWEEN_BANS / 60:.1f} minutes'
+        f'• Estimated time: {total_ops * DELAY_BETWEEN_BANS / 60:.1f} minutes',
+        ephemeral=True
     )
     
     # Process bans
@@ -311,7 +304,8 @@ async def localmassban(
         f'✅ Global mass ban complete!\n'
         f'• Successful: {results["success"]}\n'
         f'• Failed: {results["failed"]}\n'
-        f'• Skipped: {results["skipped"]}'
+        f'• Skipped: {results["skipped"]}',
+        ephemeral=True
     )
 
 
@@ -369,18 +363,18 @@ async def servermassban(
         )
         return
 
-    # Defer response
-    await interaction.response.defer()
+    # Defer response (ephemeral - only visible to the user)
+    await interaction.response.defer(ephemeral=True)
 
     # Get guild
     guild_id = interaction.guild_id
     if not guild_id:
-        await interaction.followup.send('❌ This command must be run in a server.')
+        await interaction.followup.send('❌ This command must be run in a server.', ephemeral=True)
         return
 
     guild = await get_valid_guild(guild_id)
     if not guild:
-        await interaction.followup.send('❌ Could not access guild.')
+        await interaction.followup.send('❌ Could not access guild.', ephemeral=True)
         return
 
     delete_message_days = min(delete_messages, 7)
@@ -393,7 +387,8 @@ async def servermassban(
     
     await interaction.followup.send(
         f'🔨 Starting server mass ban...\n'
-        f'• Users: {len(valid_user_ids)}'
+        f'• Users: {len(valid_user_ids)}',
+        ephemeral=True
     )
 
     results = {'success': 0, 'failed': 0, 'skipped': 0}
@@ -436,7 +431,7 @@ async def servermassban(
         if len(invalid_inputs) > 5:
             summary += f' (+{len(invalid_inputs) - 5} more)'
 
-    await interaction.followup.send(summary)
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 # ============================================================================

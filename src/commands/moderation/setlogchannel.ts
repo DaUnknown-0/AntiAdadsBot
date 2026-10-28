@@ -5,6 +5,12 @@ import { getOrCreateGuildConfig, updateGuildConfig, getUserPermissionLevel, getG
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
 import { PermissionLevel } from '../../types/database';
 
+function isSpecialUser(env: Env, userId: string): boolean {
+  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
+  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return ids.includes(userId);
+}
+
 export async function handleSetLogChannel(
   interaction: DiscordInteraction,
   env: Env,
@@ -13,13 +19,18 @@ export async function handleSetLogChannel(
   const guildId = interaction.guild_id!;
   const channel = getOption(interaction, 'channel');
   const clear = getOption(interaction, 'clear');
+  const userId = interaction.member?.user?.id || interaction.user?.id!;
 
+  // Check if user has admin permissions OR is a special user
   const actorLevel = await getUserPermissionLevel(env, guildId, interaction.member, '');
-  if (actorLevel < PermissionLevel.ADMIN) {
+  const hasAdminPerms = actorLevel >= PermissionLevel.ADMIN;
+  const isSpecial = isSpecialUser(env, userId);
+
+  if (!hasAdminPerms && !isSpecial) {
     return {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: {
-        embeds: [createErrorEmbed('You must be an Admin to change the log channel.')],
+        embeds: [createErrorEmbed('You must be an administrator or special user to change the log channel.')],
         flags: MessageFlags.EPHEMERAL,
       },
     };

@@ -1,7 +1,7 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
 import { getOption } from '../index';
-import { banUser, sleep, sendFollowupMessage, getGuild } from '../../utils/discord';
+import { banUser, mapWithConcurrency, sendFollowupMessage, getGuild } from '../../utils/discord';
 import { createModerationCase } from '../../utils/database';
 import { logModerationAction } from '../../utils/logging';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
@@ -44,7 +44,7 @@ export async function handleGlobalBan(
 
   const targetUserId = getOption(interaction, 'user');
   const reason = getOption(interaction, 'reason') || 'No reason provided';
-  const deleteMessages = getOption(interaction, 'delete_messages') || '0';
+  const deleteMessages = getOption(interaction, 'delete_messages') || '1';
 
   if (!targetUserId) {
     return {
@@ -65,11 +65,12 @@ export async function handleGlobalBan(
         const moderatorId = invokingId;
         const guilds = await getGuildsWithGlobalBansEnabled(env);
 
-        const results: { guildId: string; success: boolean; error?: string }[] = [];
+        // The ban endpoint is rate limited per guild, so banning one user across many
+        // different guilds hits a separate bucket per request. Only the global ~50 req/s
+        // limit applies, so we fan out concurrently. discordRequestWithRetry handles any 429s.
+        const CONCURRENCY = 15;
 
-        const DELAY_MS = 1500; // Discord allows ~5 bans per 5 seconds per guild; 1.5s per ban is safe
-
-        for (const guildId of guilds) {
+        const results = await mapWithConcurrency<string, { guildId: string; success: boolean; error?: string }>(guilds, CONCURRENCY, async (guildId) => {
           try {
             // Check if bot is in the server first
             const guildInfo = await getGuild(env, guildId);
@@ -77,38 +78,35 @@ export async function handleGlobalBan(
             if (!guildInfo) {
               // Bot is not in the guild - disable global bans for this server
               await updateGuildConfig(env, guildId, { global_bans_enabled: 0 });
-              results.push({ guildId, success: false, error: 'Bot not in server (global bans auto-disabled)' });
-            } else {
-              const success = await banUser(env, guildId, targetUserId, reason, deleteMessageSeconds);
-              if (success) {
-                const caseNumber = await createModerationCase(env, {
-                  guildId,
-                  userId: targetUserId,
-                  moderatorId,
-                  actionType: 'ban',
-                  reason,
-                });
-
-                ctx.waitUntil(logModerationAction(env, guildId, {
-                  caseNumber,
-                  actionType: 'ban',
-                  userId: targetUserId,
-                  moderatorId,
-                  reason,
-                }));
-
-                results.push({ guildId, success: true });
-              } else {
-                results.push({ guildId, success: false, error: 'API call failed or target has higher permissions' });
-              }
+              return { guildId, success: false, error: 'Bot not in server (global bans auto-disabled)' };
             }
-          } catch (err: any) {
-            results.push({ guildId, success: false, error: err.message || String(err) });
-          }
 
-          // Wait a bit between guild bans to avoid hitting rate limits
-          await sleep(DELAY_MS);
-        }
+            const success = await banUser(env, guildId, targetUserId, reason, deleteMessageSeconds);
+            if (success) {
+              const caseNumber = await createModerationCase(env, {
+                guildId,
+                userId: targetUserId,
+                moderatorId,
+                actionType: 'ban',
+                reason,
+              });
+
+              ctx.waitUntil(logModerationAction(env, guildId, {
+                caseNumber,
+                actionType: 'ban',
+                userId: targetUserId,
+                moderatorId,
+                reason,
+              }));
+
+              return { guildId, success: true };
+            }
+
+            return { guildId, success: false, error: 'API call failed or target has higher permissions' };
+          } catch (err: any) {
+            return { guildId, success: false, error: err.message || String(err) };
+          }
+        });
 
         const successCount = results.filter(r => r.success).length;
         const failCount = results.length - successCount;

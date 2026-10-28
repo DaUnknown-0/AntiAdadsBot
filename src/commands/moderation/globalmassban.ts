@@ -1,7 +1,7 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
 import { getOption } from '../index';
-import { banUser, sleep, sendFollowupMessage, getGuild } from '../../utils/discord';
+import { banUser, sleep, mapWithConcurrency, sendFollowupMessage, getGuild } from '../../utils/discord';
 import { createModerationCase } from '../../utils/database';
 import { logModerationAction } from '../../utils/logging';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
@@ -51,7 +51,7 @@ export async function handleGlobalMassBan(
 
   const usersRaw = getOption(interaction, 'users');
   const reason = getOption(interaction, 'reason') || 'No reason provided';
-  const deleteMessages = getOption(interaction, 'delete_messages') || '0';
+  const deleteMessages = getOption(interaction, 'delete_messages') || '1';
 
   if (!usersRaw) {
     return {
@@ -87,17 +87,24 @@ export async function handleGlobalMassBan(
       const guilds = await getGuildsWithGlobalBansEnabled(env);
       const results: { userId: string; guildId: string; success: boolean; error?: string }[] = [];
 
-      // Discord allows ~5 bans per 5 seconds per guild
-      // Using 1.5s delay per ban to stay well under the limit (5 bans/5s = 1.25s minimum)
-      const DELAY_MS = 1500;
+      // The ban endpoint is rate limited per guild (~5 bans / 5s). When banning many users
+      // in the SAME guild that limit applies, so within each guild we space bans out. But
+      // different guilds use separate buckets, so we run the guilds concurrently instead of
+      // sequentially. discordRequestWithRetry still backs off on any 429s.
+      const PER_GUILD_DELAY_MS = 1100; // ~5 bans/5s = 1s minimum; 1.1s is safe
+      const GUILD_CONCURRENCY = 15;
 
-      // Check which guilds the bot is actually in
+      // Check which guilds the bot is actually in (concurrently)
+      const guildChecks = await mapWithConcurrency(guilds, GUILD_CONCURRENCY, async (guildId) => {
+        const guildInfo = await getGuild(env, guildId);
+        return { guildId, present: !!guildInfo };
+      });
+
       const validGuilds: string[] = [];
       const invalidGuilds: { guildId: string; error: string }[] = [];
 
-      for (const guildId of guilds) {
-        const guildInfo = await getGuild(env, guildId);
-        if (guildInfo) {
+      for (const { guildId, present } of guildChecks) {
+        if (present) {
           validGuilds.push(guildId);
         } else {
           // Bot is not in the guild - disable global bans
@@ -113,9 +120,13 @@ export async function handleGlobalMassBan(
         }
       }
 
-      // Step 3: Iterate per user, then per guild to limit burst traffic per guild
-      for (const userId of userIds) {
-        for (const guildId of validGuilds) {
+      // Step 3: One worker per guild (capped). Within a guild, ban users sequentially with a
+      // small delay to respect that guild's per-guild ban bucket.
+      const perGuildResults = await mapWithConcurrency(validGuilds, GUILD_CONCURRENCY, async (guildId) => {
+        const guildResults: { userId: string; guildId: string; success: boolean; error?: string }[] = [];
+
+        for (let i = 0; i < userIds.length; i++) {
+          const userId = userIds[i];
           try {
             const success = await banUser(env, guildId, userId, reason, deleteMessageSeconds);
             if (success) {
@@ -135,16 +146,24 @@ export async function handleGlobalMassBan(
                 reason,
               }));
 
-              results.push({ userId, guildId, success: true });
+              guildResults.push({ userId, guildId, success: true });
             } else {
-              results.push({ userId, guildId, success: false, error: 'API call failed or target has higher permissions' });
+              guildResults.push({ userId, guildId, success: false, error: 'API call failed or target has higher permissions' });
             }
           } catch (err: any) {
-            results.push({ userId, guildId, success: false, error: err.message || String(err) });
+            guildResults.push({ userId, guildId, success: false, error: err.message || String(err) });
           }
 
-          await sleep(DELAY_MS);
+          if (i < userIds.length - 1) {
+            await sleep(PER_GUILD_DELAY_MS);
+          }
         }
+
+        return guildResults;
+      });
+
+      for (const arr of perGuildResults) {
+        results.push(...arr);
       }
 
       const successCount = results.filter(r => r.success).length;

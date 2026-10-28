@@ -14,7 +14,9 @@ import { handleCheckBans } from './moderation/checkbans';
 import { handleListGlobalBanServers } from './moderation/listglobalbanservers';
 import { handleAnnounce } from './moderation/announce';
 import { handleGlobalUnban } from './moderation/globalunban';
+import { handlePurgeGlobalBan } from './moderation/purgeglobalban';
 import { handleAuditGlobalBans } from './moderation/auditglobalbans';
+import { handleExportGlobalBans } from './moderation/exportglobalbans';
 
 // Command router
 export async function handleCommand(
@@ -77,8 +79,12 @@ export async function handleCommand(
         return await handleAnnounce(interaction, env, ctx);
       case 'globalunban':
         return await handleGlobalUnban(interaction, env, ctx);
+      case 'purgeglobalban':
+        return await handlePurgeGlobalBan(interaction, env, ctx);
       case 'auditglobalbans':
         return await handleAuditGlobalBans(interaction, env, ctx);
+      case 'exportglobalbans':
+        return await handleExportGlobalBans(interaction, env, ctx);
 
       default:
         return {

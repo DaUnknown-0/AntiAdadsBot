@@ -35,3 +35,42 @@ export async function addUsersToGlobalBanQueue(
 
   return inserted;
 }
+
+export async function purgeUserBanRecords(
+  env: Env,
+  userId: string
+): Promise<{
+  scheduledActionsDeleted: number;
+  userInfractionsDeleted: number;
+  moderationCasesDeleted: number;
+  globalBanRowsDeleted: number;
+}> {
+  const [scheduledActionsResult, userInfractionsResult, moderationCasesResult, globalBanRowsResult] = await env.DB.batch([
+    env.DB.prepare(
+      `DELETE FROM scheduled_actions
+       WHERE case_id IN (
+         SELECT id FROM moderation_cases WHERE user_id = ? AND action_type = 'ban'
+       )`
+    ).bind(userId),
+    env.DB.prepare(
+      `DELETE FROM user_infractions
+       WHERE case_id IN (
+         SELECT id FROM moderation_cases WHERE user_id = ? AND action_type = 'ban'
+       )`
+    ).bind(userId),
+    env.DB.prepare(
+      `DELETE FROM moderation_cases
+       WHERE user_id = ? AND action_type = 'ban'`
+    ).bind(userId),
+    env.DB.prepare(
+      'DELETE FROM global_bans WHERE user_id = ?'
+    ).bind(userId),
+  ]);
+
+  return {
+    scheduledActionsDeleted: scheduledActionsResult.meta.changes,
+    userInfractionsDeleted: userInfractionsResult.meta.changes,
+    moderationCasesDeleted: moderationCasesResult.meta.changes,
+    globalBanRowsDeleted: globalBanRowsResult.meta.changes,
+  };
+}

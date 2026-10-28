@@ -3,6 +3,15 @@ import { GuildConfig, PermissionLevel } from '../types/database';
 import { DiscordInteraction, DiscordMember } from '../types/discord';
 
 /**
+ * Check if user is a special user
+ */
+function isSpecialUser(env: Env, userId: string): boolean {
+  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
+  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return ids.includes(userId);
+}
+
+/**
  * Permission system utilities
  * Custom hierarchical permission system where admins always have all permissions
  */
@@ -13,6 +22,7 @@ export const COMMAND_PERMISSIONS: Record<string, PermissionLevel> = {
   'globalban': PermissionLevel.NONE,
   'globalmassban': PermissionLevel.NONE,
   'globalunban': PermissionLevel.NONE,
+  'purgeglobalban': PermissionLevel.NONE,
   'toggleglobalban': PermissionLevel.ADMIN,
   'checkbans': PermissionLevel.NONE,
   'listglobalbanservers': PermissionLevel.NONE,
@@ -109,6 +119,17 @@ export async function canRunCommand(
   commandName: string,
   ownerId: string
 ): Promise<{ allowed: boolean; userLevel: PermissionLevel; requiredLevel: PermissionLevel }> {
+  const userId = interaction.member?.user?.id || interaction.user?.id || '';
+
+  // Special users can always run setup commands (setlogchannel, toggleglobalban)
+  if (isSpecialUser(env, userId) && (commandName === 'setlogchannel' || commandName === 'toggleglobalban')) {
+    return {
+      allowed: true,
+      userLevel: PermissionLevel.ADMIN,
+      requiredLevel: PermissionLevel.ADMIN,
+    };
+  }
+
   // Base required level from default map
   let requiredLevel = COMMAND_PERMISSIONS[commandName] || PermissionLevel.NONE;
 

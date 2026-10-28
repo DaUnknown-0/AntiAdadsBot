@@ -30,6 +30,13 @@ Remove a user from the global ban list and unban them everywhere.
 - **user**: User to unban (required)
 - **reason**: Unban reason (optional)
 
+#### `/purgeglobalban`
+Permanently remove a user from global-ban records so they no longer appear in the ban list or exports.
+```
+/purgeglobalban user:@User
+```
+- **user**: User to purge from global-ban records (required)
+
 #### `/checkbans`
 Check if users are banned across servers.
 ```
@@ -121,6 +128,7 @@ Users listed in `SPECIAL_USER_IDS` environment variable. Can use:
 - `/globalban`
 - `/globalmassban`
 - `/globalunban`
+- `/purgeglobalban`
 - `/checkbans`
 - `/listglobalbanservers`
 - `/announce`
