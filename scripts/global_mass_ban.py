@@ -18,7 +18,25 @@ from discord.ext import commands
 # CONFIGURATION
 # ============================================================================
 
-DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', 'REDACTED_TOKEN')
+def load_dotenv(path: str) -> None:
+    """Load KEY=VALUE lines from a local .env file. Real environment variables win."""
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            value = value.strip().strip('"').strip("'")
+            if value:
+                os.environ.setdefault(key.strip(), value)
+
+
+# .env lives in the project root (one level above this script) and is gitignored
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
+
+DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
 DATABASE_ID = 'discord-moderation-db'
 
 # Hardcoded special user ID (bot owner)
