@@ -1,14 +1,8 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
-import { getOrCreateGuildConfig, updateGuildConfig, getUserPermissionLevel } from '../../utils/permissions';
+import { getInvokingUserId, getUserPermissionLevel, isSpecialUser, toggleGlobalBansEnabled } from '../../utils/permissions';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
 import { PermissionLevel } from '../../types/database';
-
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
-  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
-  return ids.includes(userId);
-}
 
 export async function handleToggleGlobalBan(
   interaction: DiscordInteraction,
@@ -16,14 +10,13 @@ export async function handleToggleGlobalBan(
   _ctx: ExecutionContext
 ): Promise<InteractionResponse> {
   const guildId = interaction.guild_id!;
-  const userId = interaction.member?.user?.id || interaction.user?.id!;
 
-  // Check if user has admin permissions OR is a special user
-  const userLevel = await getUserPermissionLevel(env, guildId, interaction.member, '');
-  const hasAdminPerms = userLevel >= PermissionLevel.ADMIN;
-  const isSpecial = isSpecialUser(env, userId);
+  // Check if user is a special user OR has admin permissions (the latter may need one D1 query)
+  const allowed =
+    isSpecialUser(env, getInvokingUserId(interaction)) ||
+    (await getUserPermissionLevel(env, guildId, interaction.member, '')) >= PermissionLevel.ADMIN;
 
-  if (!hasAdminPerms && !isSpecial) {
+  if (!allowed) {
     return {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: {
@@ -34,11 +27,8 @@ export async function handleToggleGlobalBan(
   }
 
   try {
-    const config = await getOrCreateGuildConfig(env, guildId);
-    const current = (config.global_bans_enabled as any) || 0;
-    const newValue = current ? 0 : 1;
-
-    await updateGuildConfig(env, guildId, { global_bans_enabled: newValue });
+    // Single upsert that flips the flag and returns the new value
+    const newValue = await toggleGlobalBansEnabled(env, guildId);
 
     return {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,

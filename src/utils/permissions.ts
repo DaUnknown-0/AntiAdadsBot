@@ -2,13 +2,31 @@ import { Env } from '../types/env';
 import { GuildConfig, PermissionLevel } from '../types/database';
 import { DiscordInteraction, DiscordMember } from '../types/discord';
 
+const DEFAULT_SPECIAL_USER_IDS = '1157902123888037918';
+
 /**
- * Check if user is a special user
+ * Check if user is a special user (bot owners allowed to run global commands)
  */
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
+export function isSpecialUser(env: Env, userId: string): boolean {
+  const raw = env.SPECIAL_USER_IDS || DEFAULT_SPECIAL_USER_IDS;
   const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
   return ids.includes(userId);
+}
+
+/**
+ * Get the ID of the user who triggered an interaction (guild or DM)
+ */
+export function getInvokingUserId(interaction: DiscordInteraction): string {
+  return interaction.member?.user?.id || interaction.user?.id || '';
+}
+
+/**
+ * Check for the Discord ADMINISTRATOR permission bit (no database access needed)
+ */
+function hasAdministratorPermission(member: DiscordMember | undefined): boolean {
+  if (!member?.permissions) return false;
+  const ADMINISTRATOR = 1n << 3n;
+  return (BigInt(member.permissions) & ADMINISTRATOR) === ADMINISTRATOR;
 }
 
 /**
@@ -41,7 +59,8 @@ export async function getUserPermissionLevel(
   env: Env,
   guildId: string,
   member: DiscordMember | undefined,
-  ownerId: string
+  ownerId: string,
+  preloadedConfig?: GuildConfig | null
 ): Promise<PermissionLevel> {
   if (!member || !member.user) {
     return PermissionLevel.NONE;
@@ -55,17 +74,12 @@ export async function getUserPermissionLevel(
   }
 
   // Check for administrator permission
-  if (member.permissions) {
-    const permissions = BigInt(member.permissions);
-    const ADMINISTRATOR = 1n << 3n;
-    
-    if ((permissions & ADMINISTRATOR) === ADMINISTRATOR) {
-      return PermissionLevel.ADMIN;
-    }
+  if (hasAdministratorPermission(member)) {
+    return PermissionLevel.ADMIN;
   }
 
-  // Get guild config
-  const config = await getGuildConfig(env, guildId);
+  // Get guild config (reuse the caller's copy to avoid a second D1 round trip)
+  const config = preloadedConfig === undefined ? await getGuildConfig(env, guildId) : preloadedConfig;
   if (!config) {
     return PermissionLevel.NONE;
   }
@@ -112,6 +126,7 @@ export function hasPermission(
 
 /**
  * Check if user can run a specific command
+ * Admins (level 3+) always have all permissions
  */
 export async function canRunCommand(
   env: Env,
@@ -119,19 +134,19 @@ export async function canRunCommand(
   commandName: string,
   ownerId: string
 ): Promise<{ allowed: boolean; userLevel: PermissionLevel; requiredLevel: PermissionLevel }> {
-  const userId = interaction.member?.user?.id || interaction.user?.id || '';
-
-  // Special users can always run setup commands (setlogchannel, toggleglobalban)
-  if (isSpecialUser(env, userId) && (commandName === 'setlogchannel' || commandName === 'toggleglobalban')) {
-    return {
-      allowed: true,
-      userLevel: PermissionLevel.ADMIN,
-      requiredLevel: PermissionLevel.ADMIN,
-    };
-  }
+  const userId = getInvokingUserId(interaction);
 
   // Base required level from default map
   let requiredLevel = COMMAND_PERMISSIONS[commandName] || PermissionLevel.NONE;
+
+  // Special users and server administrators pass every check, so skip the database
+  if (isSpecialUser(env, userId) || hasAdministratorPermission(interaction.member)) {
+    return {
+      allowed: true,
+      userLevel: PermissionLevel.ADMIN,
+      requiredLevel,
+    };
+  }
 
   if (!interaction.guild_id) {
     // DM commands - only allow info commands
@@ -142,9 +157,11 @@ export async function canRunCommand(
     };
   }
 
+  // Load the guild config once for both the override and the role lookup
+  const config = await getGuildConfig(env, interaction.guild_id);
+
   // Check for per-guild overrides
   try {
-    const config = await getGuildConfig(env, interaction.guild_id);
     if (config && config.command_permissions) {
       const mapping = JSON.parse(config.command_permissions || '{}') as Record<string, number | string>;
       if (mapping && mapping[commandName] !== undefined) {
@@ -165,7 +182,8 @@ export async function canRunCommand(
     env,
     interaction.guild_id,
     interaction.member,
-    ownerId
+    ownerId,
+    config
   );
 
   return {
@@ -195,18 +213,15 @@ export async function getGuildConfig(env: Env, guildId: string): Promise<GuildCo
  * Get or create guild configuration
  */
 export async function getOrCreateGuildConfig(env: Env, guildId: string): Promise<GuildConfig> {
-  let config = await getGuildConfig(env, guildId);
+  // Single round trip: insert the default row if missing, then read it back
+  const [, selected] = await env.DB.batch([
+    env.DB.prepare('INSERT INTO guild_configs (guild_id) VALUES (?) ON CONFLICT(guild_id) DO NOTHING').bind(guildId),
+    env.DB.prepare('SELECT * FROM guild_configs WHERE guild_id = ?').bind(guildId),
+  ]);
 
+  const config = (selected.results?.[0] as GuildConfig | undefined) || null;
   if (!config) {
-    // Create default config
-    await env.DB.prepare(
-      'INSERT INTO guild_configs (guild_id) VALUES (?)'
-    ).bind(guildId).run();
-
-    config = await getGuildConfig(env, guildId);
-    if (!config) {
-      throw new Error('Failed to create guild config');
-    }
+    throw new Error('Failed to create guild config');
   }
 
   return config;
@@ -220,9 +235,6 @@ export async function updateGuildConfig(
   guildId: string,
   updates: Partial<GuildConfig>
 ): Promise<void> {
-  // Ensure guild config exists first
-  await getOrCreateGuildConfig(env, guildId);
-
   const fields: string[] = [];
   const values: any[] = [];
 
@@ -237,17 +249,36 @@ export async function updateGuildConfig(
     return;
   }
 
-  fields.push('updated_at = datetime("now")');
+  fields.push("updated_at = datetime('now')");
   values.push(guildId);
 
   const query = `UPDATE guild_configs SET ${fields.join(', ')} WHERE guild_id = ?`;
-  
+
   try {
-    await env.DB.prepare(query).bind(...values).run();
+    // Ensure the row exists and update it in one batch (counts as a single D1 query)
+    await env.DB.batch([
+      env.DB.prepare('INSERT INTO guild_configs (guild_id) VALUES (?) ON CONFLICT(guild_id) DO NOTHING').bind(guildId),
+      env.DB.prepare(query).bind(...values),
+    ]);
   } catch (error) {
     console.error('Error updating guild config:', error);
     throw error;
   }
+}
+
+/**
+ * Flip the global bans flag for a guild and return the new value (single query)
+ */
+export async function toggleGlobalBansEnabled(env: Env, guildId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    `INSERT INTO guild_configs (guild_id, global_bans_enabled) VALUES (?, 1)
+     ON CONFLICT(guild_id) DO UPDATE SET
+       global_bans_enabled = 1 - COALESCE(global_bans_enabled, 0),
+       updated_at = datetime('now')
+     RETURNING global_bans_enabled`
+  ).bind(guildId).first<{ global_bans_enabled: number }>();
+
+  return row?.global_bans_enabled ?? 0;
 }
 
 /**

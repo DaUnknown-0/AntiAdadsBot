@@ -1,15 +1,9 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
 import { getOption } from '../index';
-import { getOrCreateGuildConfig, updateGuildConfig, getUserPermissionLevel, getGuildConfig } from '../../utils/permissions';
+import { updateGuildConfig, getUserPermissionLevel, getGuildConfig, getInvokingUserId, isSpecialUser } from '../../utils/permissions';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
 import { PermissionLevel } from '../../types/database';
-
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
-  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
-  return ids.includes(userId);
-}
 
 export async function handleSetLogChannel(
   interaction: DiscordInteraction,
@@ -19,14 +13,13 @@ export async function handleSetLogChannel(
   const guildId = interaction.guild_id!;
   const channel = getOption(interaction, 'channel');
   const clear = getOption(interaction, 'clear');
-  const userId = interaction.member?.user?.id || interaction.user?.id!;
 
-  // Check if user has admin permissions OR is a special user
-  const actorLevel = await getUserPermissionLevel(env, guildId, interaction.member, '');
-  const hasAdminPerms = actorLevel >= PermissionLevel.ADMIN;
-  const isSpecial = isSpecialUser(env, userId);
+  // Check if user is a special user OR has admin permissions (the latter may need one D1 query)
+  const allowed =
+    isSpecialUser(env, getInvokingUserId(interaction)) ||
+    (await getUserPermissionLevel(env, guildId, interaction.member, '')) >= PermissionLevel.ADMIN;
 
-  if (!hasAdminPerms && !isSpecial) {
+  if (!allowed) {
     return {
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
       data: {
@@ -37,10 +30,7 @@ export async function handleSetLogChannel(
   }
 
   try {
-    // Ensure guild config exists
-    await getOrCreateGuildConfig(env, guildId);
-
-    // clear takes precedence
+    // clear takes precedence (updateGuildConfig creates the row if needed)
     if (clear) {
       await updateGuildConfig(env, guildId, { mod_log_channel_id: undefined });
       return {

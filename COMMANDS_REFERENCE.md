@@ -81,8 +81,8 @@ Audit all globally banned users to ensure they're banned everywhere.
 ```
 
 This command:
-- Checks every user in the global ban database
-- Verifies they're banned in all servers with global bans enabled
+- Checks every user in the global ban list
+- Reads each server's ban list (one API request per 1000 bans), so the number of banned users does not matter
 - Shows which users are missing bans
 - Provides a button to enforce bans for all non-compliant users
 
@@ -90,7 +90,9 @@ Returns:
 - Total users checked
 - Total servers checked
 - List of users not fully banned (with ban counts)
-- **⚠️ Button to enforce all missing bans at once**
+- **⚠️ Button to enforce the missing bans** (only where a ban is actually missing)
+
+The same check runs automatically every hour (Cron Trigger) and enforces missing bans on its own.
 
 ### Server Administration (Admin Only)
 
@@ -211,11 +213,15 @@ Users with Administrator permission or admin roles. Can use:
 
 Use this regularly to ensure global bans are properly enforced!
 
-## Rate Limiting
+## Rate Limiting and Cloudflare Limits
 
-- **Global bans**: 1.5 second delay between each ban per server
-- **Discord API**: ~5 bans per 5 seconds per guild (bot automatically handles this)
-- **Commands**: Rate limited per user/guild via Durable Objects
+- **Global bans**: one bulk ban request per server and 200 users (`POST /guilds/{id}/bulk-ban`)
+- **Large jobs**: processed by the BanJob Durable Object in runs of ~40 subrequests; the original
+  message shows progress and is replaced by the result
+- **Ban checks**: one request per server and 1000 bans; servers that do not fit into one run are
+  listed as "Not checked"
+- **Discord API**: 429 responses are retried automatically
+- **Commands**: Rate limited per user/guild via Durable Objects (special users are exempt)
 
 ## Error Handling
 
@@ -227,7 +233,9 @@ Common error messages:
 | "No servers have global bans enabled" | No servers opted in | Use `/toggleglobalban` in servers |
 | "No log channel configured" | Log channel not set | Use `/setlogchannel` to set one |
 | "Bot not in server" | Bot removed from server | Bot auto-disables global bans for that server |
-| "API call failed" | Discord API error | Check bot permissions in server |
+| "Missing permissions" | Bot lacks Ban Members or Manage Server | Grant both permissions (bulk ban needs both) |
+| "Not banned (already banned, ...)" | User was already banned or outranks the bot | Usually nothing to do |
+| "Not checked (Cloudflare subrequest limit)" | Too many servers for one run | Run the check again or wait for the hourly run |
 
 ## Best Practices
 
@@ -256,7 +264,11 @@ curl -X POST https://your-worker.workers.dev/global-bans \
   -d '{"user_ids": ["123456789"], "reason": "Automated ban"}'
 ```
 
+Accepted task statuses for `POST /global-bans/{id}/result`: `pending`, `processing`, `completed`, `failed`.
+A `completed` task adds the user to the global ban list.
+
 ### Trigger Scheduled Check
+Runs automatically every hour; trigger it manually with:
 ```bash
 curl -X POST https://your-worker.workers.dev/scheduled/check-global-bans \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"

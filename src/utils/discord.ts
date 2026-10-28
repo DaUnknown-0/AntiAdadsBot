@@ -36,11 +36,17 @@ async function discordRequest(
 ): Promise<Response> {
   const url = `${DISCORD_API_BASE}${endpoint}`;
 
-  const headers = {
+  const headers: Record<string, string> = {
     Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
     'Content-Type': 'application/json',
-    ...options.headers,
+    ...(options.headers as Record<string, string> | undefined),
   };
+
+  // Header values must be ASCII: Discord expects the audit log reason URI-encoded (max 512 chars)
+  const reason = headers['X-Audit-Log-Reason'];
+  if (reason !== undefined) {
+    headers['X-Audit-Log-Reason'] = encodeURIComponent(reason.slice(0, 512));
+  }
 
   return fetch(url, {
     ...options,
@@ -204,6 +210,8 @@ export async function banUser(
   return ok;
 }
 
+export type UnbanStatus = 'unbanned' | 'not_banned' | 'guild_gone' | 'error';
+
 /**
  * Unban a user from a guild
  */
@@ -212,20 +220,27 @@ export async function unbanUser(
   guildId: string,
   userId: string,
   reason?: string
-): Promise<boolean> {
-  const response = await discordRequest(
+): Promise<{ status: UnbanStatus; error?: string }> {
+  const response = await discordRequestWithRetry(
     env,
     `/guilds/${guildId}/bans/${userId}`,
     {
       method: 'DELETE',
       headers: reason ? { 'X-Audit-Log-Reason': reason } : {},
-    }
+    },
+    2
   );
 
-  // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
-  const ok = response.ok;
-  await response.text().catch(() => {});
-  return ok;
+  if (response.ok) {
+    // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
+    await response.text().catch(() => {});
+    return { status: 'unbanned' };
+  }
+
+  const err = await readDiscordError(response);
+  if (err.code === DiscordErrorCode.UNKNOWN_BAN) return { status: 'not_banned' };
+  if (isGuildGoneError(err)) return { status: 'guild_gone' };
+  return { status: 'error', error: describeDiscordError(err) };
 }
 
 /**
@@ -541,4 +556,207 @@ export function snowflakeTimestamp(id: string): number {
   } catch (err) {
     throw new Error('Invalid snowflake ID');
   }
+}
+
+/**
+ * Discord JSON error codes the bot reacts to
+ */
+export const DiscordErrorCode = {
+  UNKNOWN_GUILD: 10004,
+  UNKNOWN_BAN: 10026,
+  MISSING_ACCESS: 50001,
+  MISSING_PERMISSIONS: 50013,
+  FAILED_TO_BAN_USERS: 500000,
+} as const;
+
+export interface DiscordApiError {
+  status: number;
+  code?: number;
+  message?: string;
+}
+
+/**
+ * Read (and consume) the body of a failed Discord response
+ */
+export async function readDiscordError(response: Response): Promise<DiscordApiError> {
+  const text = await response.text().catch(() => '');
+  try {
+    const body: any = JSON.parse(text);
+    return { status: response.status, code: body?.code, message: body?.message };
+  } catch {
+    return { status: response.status, message: text.slice(0, 200) || undefined };
+  }
+}
+
+/**
+ * The bot was removed from the guild (or the guild was deleted).
+ * Missing Permissions (50013) is deliberately NOT treated as gone: the bot is still there.
+ */
+export function isGuildGoneError(err: DiscordApiError): boolean {
+  return err.code === DiscordErrorCode.UNKNOWN_GUILD || err.code === DiscordErrorCode.MISSING_ACCESS;
+}
+
+export function describeDiscordError(err: DiscordApiError): string {
+  if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) {
+    return 'Missing permissions (bot needs Ban Members and Manage Server)';
+  }
+  if (err.status === 429) return 'Rate limited by Discord';
+  return `HTTP ${err.status}${err.code ? ` (code ${err.code})` : ''}${err.message ? `: ${err.message}` : ''}`;
+}
+
+/**
+ * Error thrown by the runtime when an invocation exceeds its subrequest budget
+ */
+export function isSubrequestLimitError(error: unknown): boolean {
+  return String((error as any)?.message || error).includes('Too many subrequests');
+}
+
+export const BULK_BAN_MAX_USERS = 200;
+
+export interface BulkBanResult {
+  banned: string[];
+  failed: string[];
+  guildGone: boolean;
+  error?: string;
+}
+
+/**
+ * Ban up to 200 users in a guild with a single request (POST /guilds/{id}/bulk-ban).
+ * Requires the bot to have both BAN_MEMBERS and MANAGE_GUILD.
+ * Users that are already banned or cannot be banned end up in `failed`.
+ */
+export async function bulkBanUsers(
+  env: Env,
+  guildId: string,
+  userIds: string[],
+  reason?: string,
+  deleteMessageSeconds?: number
+): Promise<BulkBanResult> {
+  if (userIds.length > BULK_BAN_MAX_USERS) {
+    throw new Error(`bulkBanUsers accepts at most ${BULK_BAN_MAX_USERS} users per call`);
+  }
+
+  const body: any = { user_ids: userIds };
+  if (deleteMessageSeconds) {
+    body.delete_message_seconds = Math.min(deleteMessageSeconds, 604800);
+  }
+
+  const response = await discordRequestWithRetry(
+    env,
+    `/guilds/${guildId}/bulk-ban`,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers: reason ? { 'X-Audit-Log-Reason': reason } : {},
+    },
+    2
+  );
+
+  if (response.ok) {
+    const data: any = await response.json().catch(() => ({}));
+    return {
+      banned: data.banned_users || [],
+      failed: data.failed_users || [],
+      guildGone: false,
+    };
+  }
+
+  const err = await readDiscordError(response);
+
+  // Discord answers 500000 when none of the users could be banned (e.g. all already banned)
+  if (err.code === DiscordErrorCode.FAILED_TO_BAN_USERS) {
+    return { banned: [], failed: [...userIds], guildGone: false };
+  }
+
+  if (isGuildGoneError(err)) {
+    return { banned: [], failed: [...userIds], guildGone: true };
+  }
+
+  return { banned: [], failed: [...userIds], guildGone: false, error: describeDiscordError(err) };
+}
+
+export interface GuildBanList {
+  ids: Set<string>;
+  guildGone: boolean;
+  /** false if the page limit was reached before the end of the list */
+  complete: boolean;
+  /** Number of API requests used (each page is one subrequest) */
+  requests: number;
+  error?: string;
+}
+
+/**
+ * Fetch all banned user IDs of a guild, 1000 per request.
+ * One request per guild replaces one request per user and guild.
+ */
+export async function listGuildBanIds(
+  env: Env,
+  guildId: string,
+  maxPages: number
+): Promise<GuildBanList> {
+  const ids = new Set<string>();
+  let after: string | undefined;
+  let requests = 0;
+
+  while (requests < maxPages) {
+    const query = `limit=1000${after ? `&after=${after}` : ''}`;
+    const response = await discordRequestWithRetry(env, `/guilds/${guildId}/bans?${query}`, {}, 2);
+    requests++;
+
+    if (!response.ok) {
+      const err = await readDiscordError(response);
+      const gone = isGuildGoneError(err);
+      return { ids, guildGone: gone, complete: false, requests, error: gone ? undefined : describeDiscordError(err) };
+    }
+
+    const page = (await response.json()) as Array<{ user: { id: string } }>;
+    for (const ban of page) {
+      ids.add(ban.user.id);
+    }
+
+    if (page.length < 1000) {
+      return { ids, guildGone: false, complete: true, requests };
+    }
+
+    // Bans are returned in ascending user ID order when paginating with `after`
+    after = page[page.length - 1].user.id;
+  }
+
+  return { ids, guildGone: false, complete: false, requests };
+}
+
+/**
+ * List the guilds the bot is a member of (up to 200 per request, so one request for most bots)
+ */
+export async function getCurrentUserGuilds(env: Env): Promise<Array<{ id: string; name: string }> | null> {
+  const response = await discordRequest(env, '/users/@me/guilds?limit=200');
+
+  if (!response.ok) {
+    // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
+    await response.text().catch(() => {});
+    return null;
+  }
+
+  return response.json();
+}
+
+/**
+ * Edit the original interaction response (the deferred reply or the message with the button).
+ * Uses the interaction token, which stays valid for 15 minutes.
+ */
+export async function editOriginalResponse(
+  applicationId: string,
+  token: string,
+  content: { content?: string; embeds?: DiscordEmbed[]; components?: any[] }
+): Promise<boolean> {
+  const response = await fetch(`${DISCORD_API_BASE}/webhooks/${applicationId}/${token}/messages/@original`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(content),
+  });
+
+  // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
+  const ok = response.ok;
+  await response.text().catch(() => {});
+  return ok;
 }

@@ -1,21 +1,70 @@
 import { Env } from '../../types/env';
-import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
+import { DiscordInteraction, InteractionResponse, InteractionResponseType } from '../../types/discord';
 import { getOption } from '../index';
-import { isUserBanned, sendFollowupMessage } from '../../utils/discord';
-import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
-import { getGuildsWithGlobalBansEnabled } from '../../utils/databaseExtras';
+import { editOriginalResponse } from '../../utils/discord';
+import { appendLimited, createSuccessEmbed } from '../../utils/logging';
+import { createPendingBanAction, getGuildsWithGlobalBansEnabled } from '../../utils/databaseExtras';
+import { findMissingBans, MissingBansReport, parseUserIds } from '../../utils/banCheck';
+import { getInvokingUserId } from '../../utils/permissions';
+import { ephemeralError, rejectUnlessSpecialUser, replyError } from './globalBanShared';
 
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
-  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
-  return ids.includes(userId);
-}
+// Subrequests left for ban list pages after attachment download, D1 queries and the reply
+const BAN_LIST_REQUEST_BUDGET = 40;
 
-function parseUsersList(raw: string): string[] {
-  return raw
-    .split(/[,\s]+/)
-    .map(s => s.replace(/[<@!>]/g, '').trim())
-    .filter(Boolean);
+/**
+ * Build the "not fully banned" part of a report plus the confirmation button
+ */
+export async function buildMissingBansReply(
+  env: Env,
+  report: MissingBansReport,
+  header: string,
+  options: { reason: string; requestedBy: string; buttonPrefix: string; buttonLabel: (users: number, bans: number) => string; maxListed?: number }
+): Promise<{ message: string; components?: any[] }> {
+  let message = header;
+
+  if (report.goneGuilds.length > 0) {
+    message += `\n\n⚠️ Bot is no longer in ${report.goneGuilds.length} server(s); global bans were disabled there.`;
+  }
+  if (report.uncheckedGuilds.length > 0) {
+    message += '\n\n**Not checked:**';
+    message = appendLimited(message, report.uncheckedGuilds.map(u => `• Server ID: ${u.guildId} - ${u.reason}`), 1500);
+  }
+
+  if (report.missing.size === 0) {
+    message += `\n\n✅ All users are banned in all checked servers.`;
+    return { message };
+  }
+
+  const checked = report.checkedGuilds.length;
+  const lines = [...report.missing.entries()].map(
+    ([userId, guilds]) => `• <@${userId}> (\`${userId}\`): Banned in ${checked - guilds.length}/${checked} servers`
+  );
+  message += `\n\n⚠️ **Users not fully banned (${report.missing.size}):**`;
+  message = appendLimited(message, lines, 3500);
+
+  const missingBans = Object.fromEntries(report.missing);
+  const actionId = await createPendingBanAction(env, missingBans, options.reason, options.requestedBy);
+
+  const totalMissing = [...report.missing.values()].reduce((sum, guilds) => sum + guilds.length, 0);
+  message += `\n\n**Click the button below to ban these ${report.missing.size} user(s) in the ${totalMissing} place(s) where they are not banned.**`;
+
+  return {
+    message,
+    components: [
+      {
+        type: 1, // Action Row
+        components: [
+          {
+            type: 2, // Button
+            style: 4, // Danger (red)
+            label: options.buttonLabel(report.missing.size, totalMissing).slice(0, 80),
+            custom_id: `${options.buttonPrefix}${actionId}`,
+            emoji: { name: '🔨' },
+          },
+        ],
+      },
+    ],
+  };
 }
 
 export async function handleCheckBans(
@@ -23,30 +72,15 @@ export async function handleCheckBans(
   env: Env,
   ctx: ExecutionContext
 ): Promise<InteractionResponse> {
-  const invokingId = interaction.member?.user?.id || interaction.user?.id!;
-
-  if (!isSpecialUser(env, invokingId)) {
-    return {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: {
-        embeds: [createErrorEmbed('You are not authorized to use this command.')],
-        flags: MessageFlags.EPHEMERAL,
-      },
-    };
-  }
+  const rejection = rejectUnlessSpecialUser(env, interaction);
+  if (rejection) return rejection;
 
   const usersRaw = getOption(interaction, 'users');
   const fileId = getOption(interaction, 'file');
   const serverId = getOption(interaction, 'server');
 
   if (!usersRaw && !fileId) {
-    return {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: {
-        embeds: [createErrorEmbed('Please provide either a comma-separated list of user IDs or upload a file.')],
-        flags: MessageFlags.EPHEMERAL,
-      },
-    };
+    return ephemeralError('Please provide either a comma-separated list of user IDs or upload a file.');
   }
 
   // Return deferred response immediately
@@ -61,185 +95,53 @@ export async function handleCheckBans(
           if (attachment && attachment.url) {
             try {
               const response = await fetch(attachment.url);
-              const text = await response.text();
-
-              // Parse file content (supports both newline and comma-separated)
-              userIds = text
-                .split(/[\n,\s]+/)
-                .map(s => s.replace(/[<@!>]/g, '').trim())
-                .filter(Boolean);
+              userIds = parseUserIds(await response.text());
             } catch (err) {
               console.error('Error fetching attachment:', err);
-              await sendFollowupMessage(interaction.application_id, interaction.token, {
-                embeds: [createErrorEmbed('Failed to read the uploaded file.')],
-              });
+              await replyError(interaction, 'Failed to read the uploaded file.');
               return;
             }
           }
         } else if (usersRaw) {
-          userIds = parseUsersList(usersRaw);
+          userIds = parseUserIds(usersRaw);
         }
 
         if (userIds.length === 0) {
-          await sendFollowupMessage(interaction.application_id, interaction.token, {
-            embeds: [createErrorEmbed('No valid user IDs found in the provided input.')],
-          });
+          await replyError(interaction, 'No valid user IDs found in the provided input.');
           return;
         }
 
         // Get guilds to check - either single server or all with global bans enabled
-        let guilds: string[];
-        let isSingleServer = false;
+        const guilds = serverId ? [String(serverId).trim()] : await getGuildsWithGlobalBansEnabled(env);
 
-        if (serverId) {
-          // Single server mode
-          guilds = [serverId];
-          isSingleServer = true;
-        } else {
-          guilds = await getGuildsWithGlobalBansEnabled(env);
-
-          if (guilds.length === 0) {
-            await sendFollowupMessage(interaction.application_id, interaction.token, {
-              embeds: [createErrorEmbed('No servers have global bans enabled.')],
-            });
-            return;
-          }
-        }
-
-        // Track which servers each user is NOT banned in
-        const missingBans: Map<string, string[]> = new Map(); // userId -> [guildIds where NOT banned]
-        const banCheckResults: { userId: string; bannedCount: number; totalServers: number; missingGuilds: string[] }[] = [];
-
-        // Cloudflare Workers has a HARD limit of ~50 subrequests per invocation
-        // We need to stay well under this (leaving room for other API calls)
-        const MAX_CHECKS = 40;
-        const maxChecks = userIds.length * guilds.length;
-
-        if (maxChecks > MAX_CHECKS) {
-          const maxUsers = Math.floor(MAX_CHECKS / guilds.length);
-          await sendFollowupMessage(interaction.application_id, interaction.token, {
-            embeds: [createErrorEmbed(
-              `Too many checks required (${userIds.length} users × ${guilds.length} servers = ${maxChecks} API calls).\n\n` +
-              `**Cloudflare Workers limit: ~50 API calls per request.**\n\n` +
-              `With ${guilds.length} servers, you can check at most **${maxUsers} users** at a time.\n\n` +
-              `For bulk checking, use \`/auditglobalbans\` which checks users already in the global ban list, or split your list into smaller batches.`
-            )],
-          });
+        if (guilds.length === 0) {
+          await replyError(interaction, 'No servers have global bans enabled.');
           return;
         }
 
-        // Check ban status for each user across all guilds with controlled concurrency
-        for (const userId of userIds) {
-          let bannedCount = 0;
-          const userMissingGuilds: string[] = [];
+        // One request per server (1000 bans per page) instead of one per user and server
+        const report = await findMissingBans(env, userIds, guilds, BAN_LIST_REQUEST_BUDGET);
 
-          // Use Promise.all for parallel checks but limit concurrency to avoid timeout
-          const MAX_CONCURRENT = 10;
-          for (let i = 0; i < guilds.length; i += MAX_CONCURRENT) {
-            const chunk = guilds.slice(i, i + MAX_CONCURRENT);
-            const results = await Promise.allSettled(
-              chunk.map(guildId =>
-                isUserBanned(env, guildId, userId)
-                  .then(isBanned => ({ guildId, isBanned }))
-                  .catch(() => ({ guildId, isBanned: false }))
-              )
-            );
+        const header =
+          `**Ban Status Check Complete**\n\n` +
+          (serverId
+            ? `Checked ${userIds.length} user(s) in server \`${serverId}\`.`
+            : `Checked ${userIds.length} user(s) across ${report.checkedGuilds.length} server(s) with global bans enabled.`);
 
-            for (const result of results) {
-              if (result.status === 'fulfilled') {
-                const { guildId, isBanned } = result.value;
-                if (isBanned) {
-                  bannedCount++;
-                } else {
-                  userMissingGuilds.push(guildId);
-                }
-              } else {
-                // If promise rejected, assume not banned
-                console.error('Ban check failed:', result.reason);
-              }
-            }
-          }
+        const { message, components } = await buildMissingBansReply(env, report, header, {
+          reason: 'Ban enforcement from checkbans',
+          requestedBy: getInvokingUserId(interaction),
+          buttonPrefix: 'checkban_',
+          buttonLabel: (users, bans) => `Ban ${users} User${users > 1 ? 's' : ''} (${bans} bans)`,
+        });
 
-          banCheckResults.push({
-            userId,
-            bannedCount,
-            totalServers: guilds.length,
-            missingGuilds: userMissingGuilds,
-          });
-
-          if (userMissingGuilds.length > 0) {
-            missingBans.set(userId, userMissingGuilds);
-          }
-        }
-
-        // Build response message
-        let message = `**Ban Status Check Complete**\n\n`;
-        if (isSingleServer) {
-          message += `Checked ${userIds.length} user(s) in server \`${serverId}\`.\n\n`;
-        } else {
-          message += `Checked ${userIds.length} user(s) across ${guilds.length} server(s) with global bans enabled.\n\n`;
-        }
-
-        let components = undefined;
-
-        if (missingBans.size === 0) {
-          message += `✅ All users are banned in all servers.`;
-        } else {
-          message += `⚠️ **Users not fully banned:**\n`;
-          for (const result of banCheckResults) {
-            if (result.missingGuilds.length > 0) {
-              message += `• <@${result.userId}> (${result.userId}): Banned in ${result.bannedCount}/${result.totalServers} servers\n`;
-            }
-          }
-
-          // Store pending action in database with the mapping of users to missing guilds
-          const actionId = crypto.randomUUID();
-          const missingBansObj: Record<string, string[]> = {};
-          missingBans.forEach((guildIds, oderId) => {
-            missingBansObj[oderId] = guildIds;
-          });
-
-          await env.DB.prepare(
-            `INSERT INTO pending_ban_actions (id, user_ids, reason, delete_messages, requested_by) VALUES (?, ?, ?, ?, ?)`
-          ).bind(
-            actionId,
-            JSON.stringify(missingBansObj), // Now stores {userId: [missingGuildIds]} instead of just [userIds]
-            'Ban enforcement from checkbans',
-            0,
-            invokingId
-          ).run();
-
-          const totalMissingBans = Array.from(missingBans.values()).reduce((sum, arr) => sum + arr.length, 0);
-          message += `\n**Click the button below to ban these ${missingBans.size} user(s) in the ${totalMissingBans} server(s) where they are not banned.**`;
-
-          // Add button component
-          components = [
-            {
-              type: 1, // Action Row
-              components: [
-                {
-                  type: 2, // Button
-                  style: 4, // Danger (red)
-                  label: `Ban ${missingBans.size} User${missingBans.size > 1 ? 's' : ''} (${totalMissingBans} bans)`,
-                  custom_id: `checkban_${actionId}`,
-                  emoji: {
-                    name: '🔨'
-                  }
-                }
-              ]
-            }
-          ];
-        }
-
-        await sendFollowupMessage(interaction.application_id, interaction.token, {
+        await editOriginalResponse(interaction.application_id, interaction.token, {
           embeds: [createSuccessEmbed(message)],
           components,
         });
       } catch (error) {
         console.error('Error during ban check:', error);
-        await sendFollowupMessage(interaction.application_id, interaction.token, {
-          embeds: [createErrorEmbed('An error occurred while checking ban status.')],
-        });
+        await replyError(interaction, 'An error occurred while checking ban status.');
       }
     })()
   );

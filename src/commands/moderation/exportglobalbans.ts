@@ -1,14 +1,9 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
+import { getInvokingUserId, isSpecialUser } from '../../utils/permissions';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
-
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
-  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
-  return ids.includes(userId);
-}
 
 /**
  * Send a followup message that contains a plain-text file attachment.
@@ -56,7 +51,7 @@ export async function handleExportGlobalBans(
   env: Env,
   ctx: ExecutionContext
 ): Promise<InteractionResponse> {
-  const invokingId = interaction.member?.user?.id || interaction.user?.id!;
+  const invokingId = getInvokingUserId(interaction);
 
   if (!isSpecialUser(env, invokingId)) {
     return {
@@ -72,16 +67,9 @@ export async function handleExportGlobalBans(
   ctx.waitUntil(
     (async () => {
       try {
-        // Query moderation_cases (the only table all ban paths write to).
-        // A user is considered globally banned if they were banned in 2+ guilds,
-        // which distinguishes global bans from single-server moderator bans.
+        // The global ban list holds exactly one row per globally banned user
         const results = await env.DB.prepare(
-          `SELECT user_id
-           FROM moderation_cases
-           WHERE action_type = 'ban'
-           GROUP BY user_id
-           HAVING COUNT(DISTINCT guild_id) >= 2
-           ORDER BY MIN(created_at) DESC`
+          'SELECT user_id FROM global_ban_list ORDER BY created_at DESC'
         ).all<{ user_id: string }>();
 
         const rows = results.results || [];

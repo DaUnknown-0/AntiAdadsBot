@@ -1,3 +1,5 @@
+import type { BanJob } from '../durable-objects/BanJob';
+
 // Environment bindings for Cloudflare Workers
 export interface Env {
   // Discord credentials
@@ -9,7 +11,7 @@ export interface Env {
   DB: D1Database;
   CACHE: KVNamespace;
   RATE_LIMITER: DurableObjectNamespace;
-  SCHEDULED_ACTIONS: DurableObjectNamespace;
+  BAN_JOBS: DurableObjectNamespace<BanJob>;
 
   // Optional runtime feature flags
   DISABLE_GLOBAL_BAN_WORKER?: string;
@@ -20,13 +22,4 @@ export interface Env {
 
   // Comma-separated list of special user IDs allowed to use global commands
   SPECIAL_USER_IDS?: string;
-}
-
-// Durable Object stub types
-export interface RateLimiterStub extends DurableObjectStub {
-  fetch(request: Request): Promise<Response>;
-}
-
-export interface ScheduledActionsStub extends DurableObjectStub {
-  fetch(request: Request): Promise<Response>;
 }

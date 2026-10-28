@@ -1,9 +1,18 @@
 name = "discord-moderation-bot"
 main = "src/index.ts"
-compatibility_date = "2024-01-10"
-compatibility_flags = ["nodejs_compat"]
+# 2024-04-03 or later is required for Durable Object RPC (BanJob.start)
+compatibility_date = "2025-12-01"
 
 # Environment variables are set via wrangler secrets (use `npx wrangler secret put`)
+
+# Run the Worker close to its backend (D1) instead of close to Discord when that is faster.
+# Each slash command makes several sequential D1 round trips, so this can cut response time.
+[placement]
+mode = "smart"
+
+# Hourly global ban enforcement (replaces the external cron-job.org call, free on every plan)
+[triggers]
+crons = ["0 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
@@ -16,19 +25,24 @@ id = "7015f5bb2436428db18e660fc8b3ea7b"
 preview_id = "ceb53756d69a47ae9a3e952c3df04f15"
 
 # Durable Objects bindings
+# (no script_name: the classes live in this Worker, so every environment uses its own instances)
 [[durable_objects.bindings]]
 name = "RATE_LIMITER"
 class_name = "RateLimiter"
-script_name = "discord-moderation-bot"
 
 [[durable_objects.bindings]]
-name = "SCHEDULED_ACTIONS"
-class_name = "ScheduledActions"
-script_name = "discord-moderation-bot"
+name = "BAN_JOBS"
+class_name = "BanJob"
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RateLimiter", "ScheduledActions"]
+
+# ScheduledActions was never used and would have stored the bot token in Durable Object storage
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["BanJob"]
+deleted_classes = ["ScheduledActions"]
 
 # For development
 [env.dev]
@@ -38,6 +52,14 @@ name = "discord-moderation-bot-dev"
 binding = "DB"
 database_name = "discord-moderation-db-dev"
 database_id = ""
+
+[[env.dev.durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[env.dev.durable_objects.bindings]]
+name = "BAN_JOBS"
+class_name = "BanJob"
 
 # Dev KV namespace binding (create dev KV namespace and set id here):
 # [[env.dev.kv_namespaces]]

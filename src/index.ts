@@ -2,12 +2,18 @@ import { verifyKey } from 'discord-interactions';
 import { Env } from './types/env';
 import { DiscordInteraction, InteractionType, InteractionResponseType } from './types/discord';
 import { RateLimiter } from './durable-objects/RateLimiter';
-import { ScheduledActions } from './durable-objects/ScheduledActions';
+import { BanJob, startBanJob } from './durable-objects/BanJob';
 import { handleCommand } from './commands';
+import { handleButtonInteraction } from './commands/moderation/handleButtonInteraction';
 import { JsonResponse, ErrorResponse } from './utils/responses';
+import { getInvokingUserId, isSpecialUser } from './utils/permissions';
+import { addToGlobalBanListStatement, getGlobalBanList, getGuildsWithGlobalBansEnabled } from './utils/databaseExtras';
+import { findMissingBans, invertMissingBans } from './utils/banCheck';
 
 // Export Durable Object classes
-export { RateLimiter, ScheduledActions };
+export { RateLimiter, BanJob };
+
+const GLOBAL_BAN_TASK_STATUSES = new Set(['pending', 'processing', 'completed', 'failed']);
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -75,30 +81,43 @@ export default {
     if (request.method === 'POST' && (url.pathname === '/global-bans' || resultMatch)) {
       if (!isAdmin()) return ErrorResponse('unauthorized', 401);
       const body: any = await request.json().catch(() => null);
+      if (!body || typeof body !== 'object') return ErrorResponse('invalid_json', 400);
+
       if (url.pathname === '/global-bans') {
-        const user_ids = body.user_ids || (body.user_id ? [body.user_id] : []);
+        const user_ids: unknown[] = Array.isArray(body.user_ids) ? body.user_ids : (body.user_id ? [body.user_id] : []);
         if (!user_ids.length) return ErrorResponse('missing_user_ids', 400);
+        if (!user_ids.every(uid => typeof uid === 'string' && /^\d{15,21}$/.test(uid))) {
+          return ErrorResponse('invalid_user_ids', 400);
+        }
         const reason = body.reason || '';
         const del = Number(body.delete_messages) || 0;
         const requested_by = body.requested_by || null;
         const created = new Date().toISOString();
-        const inserted: any[] = [];
-        for (const uid of user_ids) {
-          const id = crypto.randomUUID();
-          const sql = `INSERT INTO global_bans (id, user_id, requested_by, reason, delete_messages, status, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`;
-          await env.DB.prepare(sql).bind(id, uid, requested_by, reason, del, created, created).run();
-          inserted.push({ id, user_id: uid });
-        }
+        const inserted = (user_ids as string[]).map(uid => ({ id: crypto.randomUUID(), user_id: uid }));
+        const sql = `INSERT INTO global_bans (id, user_id, requested_by, reason, delete_messages, status, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`;
+        // One batch counts as a single D1 query, however many users are inserted
+        await env.DB.batch(inserted.map(row => env.DB.prepare(sql).bind(row.id, row.user_id, requested_by, reason, del, created, created)));
         return JsonResponse({ ids: inserted }, 201);
       }
 
       // POST /global-bans/:id/result
       const id = resultMatch![1];
       const status = body.status;
+      if (typeof status !== 'string' || !GLOBAL_BAN_TASK_STATUSES.has(status)) {
+        return ErrorResponse(`invalid_status (expected one of: ${[...GLOBAL_BAN_TASK_STATUSES].join(', ')})`, 400);
+      }
       const attempts = Number(body.attempts || 0);
       const last_error = body.last_error || null;
       const updated = new Date().toISOString();
-      await env.DB.prepare(`UPDATE global_bans SET status = ?, attempts = ?, last_error = ?, updated_at = ? WHERE id = ?`).bind(status, attempts, last_error, updated, id).run();
+      const task = await env.DB.prepare(
+        `UPDATE global_bans SET status = ?, attempts = ?, last_error = ?, updated_at = ? WHERE id = ? RETURNING user_id, reason, requested_by`
+      ).bind(status, attempts, last_error, updated, id).first<{ user_id: string; reason: string | null; requested_by: string | null }>();
+      if (!task) return ErrorResponse('not_found', 404);
+
+      // Completed tasks put the user on the global ban list (audits and exports read from there)
+      if (status === 'completed') {
+        await addToGlobalBanListStatement(env, [task.user_id], task.reason, task.requested_by).run();
+      }
       return JsonResponse({ ok: true });
     }
 
@@ -127,12 +146,11 @@ export default {
     // Handle application commands
     if (interaction.type === InteractionType.APPLICATION_COMMAND) {
       try {
-        // Check rate limit
-        const rateLimitResult = await checkRateLimit(
-          env,
-          interaction.guild_id || 'dm',
-          interaction.member?.user?.id || interaction.user?.id || 'unknown'
-        );
+        // Check rate limit (skipped for special users: saves a Durable Object round trip per command)
+        const userId = getInvokingUserId(interaction);
+        const rateLimitResult: { allowed: boolean; retryAfter?: number } = isSpecialUser(env, userId)
+          ? { allowed: true }
+          : await checkRateLimit(env, interaction.guild_id || 'dm', userId || 'unknown');
 
         if (!rateLimitResult.allowed) {
           return JsonResponse({
@@ -162,7 +180,6 @@ export default {
     // Handle button interactions
     if (interaction.type === InteractionType.MESSAGE_COMPONENT) {
       try {
-        const { handleButtonInteraction } = await import('./commands/moderation/handleButtonInteraction');
         const response = await handleButtonInteraction(interaction, env, ctx);
         return JsonResponse(response);
       } catch (error) {
@@ -179,6 +196,11 @@ export default {
 
     // Handle other interaction types
     return ErrorResponse('Unknown interaction type', 400);
+  },
+
+  // Native Cron Trigger (see [triggers] in wrangler.toml), free on every plan
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(enforceGlobalBans(env));
   },
 };
 
@@ -217,55 +239,51 @@ async function handleScheduledGlobalBanCheck(
     return ErrorResponse('unauthorized', 401);
   }
 
-  ctx.waitUntil(
-    (async () => {
-      try {
-        const { getGuildsWithGlobalBansEnabled, getGlobalBanList } = await import('./utils/databaseExtras');
-        const { isUserBanned, banUser } = await import('./utils/discord');
-
-        const guilds = await getGuildsWithGlobalBansEnabled(env);
-        const globalBans = await getGlobalBanList(env);
-
-        console.log(`Checking ${globalBans.length} globally banned users across ${guilds.length} servers`);
-
-        let enforcedBans = 0;
-        let errors = 0;
-
-        for (const ban of globalBans) {
-          for (const guildId of guilds) {
-            try {
-              const isBanned = await isUserBanned(env, guildId, ban.user_id);
-
-              if (!isBanned) {
-                // User should be banned but isn't - enforce the ban
-                const success = await banUser(
-                  env,
-                  guildId,
-                  ban.user_id,
-                  ban.reason || 'Global ban enforcement',
-                  0
-                );
-
-                if (success) {
-                  enforcedBans++;
-                  console.log(`Enforced global ban for user ${ban.user_id} in guild ${guildId}`);
-                } else {
-                  errors++;
-                }
-              }
-            } catch (err) {
-              console.error(`Error checking/enforcing ban for ${ban.user_id} in ${guildId}:`, err);
-              errors++;
-            }
-          }
-        }
-
-        console.log(`Global ban check complete. Enforced: ${enforcedBans}, Errors: ${errors}`);
-      } catch (error) {
-        console.error('Error during scheduled global ban check:', error);
-      }
-    })()
-  );
+  ctx.waitUntil(enforceGlobalBans(env));
 
   return JsonResponse({ success: true, message: 'Global ban check started' });
+}
+
+/**
+ * Make sure everyone on the global ban list is banned in every enabled server.
+ * Reads each server's ban list (one request per 1000 bans) and hands only the missing
+ * bans to a BanJob, so the run stays far below the 50-subrequest limit.
+ */
+async function enforceGlobalBans(env: Env): Promise<void> {
+  try {
+    const [globalBans, guilds] = await Promise.all([
+      getGlobalBanList(env),
+      getGuildsWithGlobalBansEnabled(env),
+      // Housekeeping: buttons older than an hour can no longer be used
+      env.DB.prepare("DELETE FROM pending_ban_actions WHERE expires_at <= datetime('now')").run(),
+    ]);
+
+    if (globalBans.length === 0 || guilds.length === 0) {
+      console.log(`Global ban check skipped: ${globalBans.length} banned users, ${guilds.length} servers`);
+      return;
+    }
+
+    const report = await findMissingBans(env, globalBans.map(b => b.user_id), guilds, 44);
+    const missingCount = [...report.missing.values()].reduce((sum, g) => sum + g.length, 0);
+
+    console.log(
+      `Checked ${globalBans.length} globally banned users across ${report.checkedGuilds.length} servers: ` +
+      `${missingCount} missing bans, ${report.uncheckedGuilds.length} servers not checked, ${report.goneGuilds.length} servers left`
+    );
+
+    if (missingCount === 0) return;
+
+    const byGuild = invertMissingBans(Object.fromEntries(report.missing));
+    await startBanJob(env, {
+      kind: 'ban',
+      title: 'Scheduled global ban enforcement',
+      targets: [...byGuild.entries()].map(([guildId, userIds]) => ({ guildId, userIds })),
+      reason: 'Global ban enforcement',
+      deleteMessageSeconds: 0,
+      // A bot's user ID equals its application ID
+      moderatorId: env.DISCORD_APPLICATION_ID,
+    });
+  } catch (error) {
+    console.error('Error during scheduled global ban check:', error);
+  }
 }

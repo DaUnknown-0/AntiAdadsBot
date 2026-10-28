@@ -6,14 +6,61 @@ import { ModerationCase } from '../types/database';
  */
 
 /**
- * Get next case number for a guild
+ * Create moderation cases (and their infraction records) for several users in one guild.
+ * Runs as a single D1 batch, which counts as one query against the per-invocation limit,
+ * and numbers the cases inside the transaction so concurrent jobs cannot collide.
  */
-export async function getNextCaseNumber(env: Env, guildId: string): Promise<number> {
-  const result = await env.DB.prepare(
-    'SELECT MAX(case_number) as max_case FROM moderation_cases WHERE guild_id = ?'
-  ).bind(guildId).first<{ max_case: number | null }>();
+export async function createModerationCases(
+  env: Env,
+  data: {
+    guildId: string;
+    userIds: string[];
+    moderatorId: string;
+    actionType: string;
+    reason?: string;
+    duration?: number;
+    expiresAt?: string;
+  }
+): Promise<Array<{ userId: string; caseNumber: number }>> {
+  if (data.userIds.length === 0) {
+    return [];
+  }
 
-  return (result?.max_case || 0) + 1;
+  const userIdsJson = JSON.stringify(data.userIds);
+
+  const [inserted] = await env.DB.batch([
+    env.DB.prepare(
+      `WITH base AS (
+         SELECT COALESCE(MAX(case_number), 0) AS max_case FROM moderation_cases WHERE guild_id = ?1
+       )
+       INSERT INTO moderation_cases
+         (guild_id, case_number, user_id, moderator_id, action_type, reason, duration, expires_at, active)
+       SELECT ?1, base.max_case + j.key + 1, j.value, ?3, ?4, ?5, ?6, ?7, 1
+       FROM json_each(?2) AS j, base
+       RETURNING user_id, case_number`
+    ).bind(
+      data.guildId,
+      userIdsJson,
+      data.moderatorId,
+      data.actionType,
+      data.reason || null,
+      data.duration || null,
+      data.expiresAt || null
+    ),
+    env.DB.prepare(
+      `INSERT INTO user_infractions (user_id, guild_id, infraction_type, case_id)
+       SELECT mc.user_id, mc.guild_id, mc.action_type, mc.id
+       FROM moderation_cases mc
+       WHERE mc.guild_id = ?1
+         AND mc.user_id IN (SELECT value FROM json_each(?2))
+         AND NOT EXISTS (SELECT 1 FROM user_infractions ui WHERE ui.case_id = mc.id)`
+    ).bind(data.guildId, userIdsJson),
+  ]);
+
+  const rows = (inserted.results || []) as Array<{ user_id: string; case_number: number }>;
+  return rows
+    .map((r) => ({ userId: r.user_id, caseNumber: r.case_number }))
+    .sort((a, b) => a.caseNumber - b.caseNumber);
 }
 
 /**
@@ -31,34 +78,8 @@ export async function createModerationCase(
     expiresAt?: string;
   }
 ): Promise<number> {
-  const caseNumber = await getNextCaseNumber(env, data.guildId);
-
-  const result = await env.DB.prepare(
-    `INSERT INTO moderation_cases 
-    (guild_id, case_number, user_id, moderator_id, action_type, reason, duration, expires_at, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
-  )
-    .bind(
-      data.guildId,
-      caseNumber,
-      data.userId,
-      data.moderatorId,
-      data.actionType,
-      data.reason || null,
-      data.duration || null,
-      data.expiresAt || null
-    )
-    .run();
-
-  // Create infraction record
-  await env.DB.prepare(
-    `INSERT INTO user_infractions (user_id, guild_id, infraction_type, case_id)
-    VALUES (?, ?, ?, ?)`
-  )
-    .bind(data.userId, data.guildId, data.actionType, result.meta.last_row_id)
-    .run();
-
-  return caseNumber;
+  const [created] = await createModerationCases(env, { ...data, userIds: [data.userId] });
+  return created.caseNumber;
 }
 
 /**

@@ -2,21 +2,16 @@ import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
 import { getOption } from '../index';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
+import { getInvokingUserId, isSpecialUser } from '../../utils/permissions';
 import { purgeUserBanRecords } from '../../utils/databaseExtras';
 import { sendFollowupMessage } from '../../utils/discord';
-
-function isSpecialUser(env: Env, userId: string): boolean {
-  const raw = env.SPECIAL_USER_IDS || '1157902123888037918';
-  const ids = raw.split(',').map(s => s.trim()).filter(Boolean);
-  return ids.includes(userId);
-}
 
 export async function handlePurgeGlobalBan(
   interaction: DiscordInteraction,
   env: Env,
   ctx: ExecutionContext
 ): Promise<InteractionResponse> {
-  const invokingId = interaction.member?.user?.id || interaction.user?.id!;
+  const invokingId = getInvokingUserId(interaction);
 
   if (!isSpecialUser(env, invokingId)) {
     return {
