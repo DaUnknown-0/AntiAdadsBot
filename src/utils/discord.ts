@@ -138,6 +138,14 @@ export async function discordRequestWithRetry(
     const res = await discordRequest(env, endpoint, options);
 
     if (res.status !== 429) {
+      // Bucket exhausted: wait for the reset now instead of running into a 429 next time.
+      // Waiting costs no subrequests, a 429 retry costs one.
+      if (res.headers.get('x-ratelimit-remaining') === '0') {
+        const resetAfter = parseFloat(res.headers.get('x-ratelimit-reset-after') || '');
+        if (!isNaN(resetAfter) && resetAfter > 0) {
+          await sleep(Math.min(Math.ceil(resetAfter * 1000), 10_000));
+        }
+      }
       // Not rate limited - return response (caller must consume body)
       return res;
     }
@@ -182,16 +190,22 @@ export async function discordRequestWithRetry(
   }
 }
 
+export type BanStatus = 'banned' | 'guild_gone' | 'missing_permissions' | 'error';
+
+/**
+ * Ban a single user. Only needs BAN_MEMBERS, so it is the fallback for servers where the bot
+ * lacks MANAGE_GUILD for the bulk ban endpoint. Banning an already banned user also succeeds.
+ */
 export async function banUser(
   env: Env,
   guildId: string,
   userId: string,
   reason?: string,
   deleteMessageSeconds?: number
-): Promise<boolean> {
+): Promise<{ status: BanStatus; error?: string }> {
   const body: any = {};
   if (deleteMessageSeconds) {
-    body.delete_message_seconds = deleteMessageSeconds;
+    body.delete_message_seconds = Math.min(deleteMessageSeconds, 604800);
   }
 
   const response = await discordRequestWithRetry(
@@ -201,13 +215,20 @@ export async function banUser(
       method: 'PUT',
       body: JSON.stringify(body),
       headers: reason ? { 'X-Audit-Log-Reason': reason } : {},
-    }
+    },
+    2
   );
 
-  // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
-  const ok = response.ok;
-  await response.text().catch(() => {});
-  return ok;
+  if (response.ok) {
+    // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
+    await response.text().catch(() => {});
+    return { status: 'banned' };
+  }
+
+  const err = await readDiscordError(response);
+  if (isGuildGoneError(err)) return { status: 'guild_gone' };
+  if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) return { status: 'missing_permissions', error: describeDiscordError(err) };
+  return { status: 'error', error: describeDiscordError(err) };
 }
 
 export type UnbanStatus = 'unbanned' | 'not_banned' | 'guild_gone' | 'error';
@@ -598,7 +619,8 @@ export function isGuildGoneError(err: DiscordApiError): boolean {
 
 export function describeDiscordError(err: DiscordApiError): string {
   if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) {
-    return 'Missing permissions (bot needs Ban Members and Manage Server)';
+    // Bulk bans fall back to single bans without Manage Server, so this means Ban Members is missing
+    return 'Missing permissions (bot needs Ban Members)';
   }
   if (err.status === 429) return 'Rate limited by Discord';
   return `HTTP ${err.status}${err.code ? ` (code ${err.code})` : ''}${err.message ? `: ${err.message}` : ''}`;
@@ -617,12 +639,15 @@ export interface BulkBanResult {
   banned: string[];
   failed: string[];
   guildGone: boolean;
+  /** The bot lacks MANAGE_GUILD (or BAN_MEMBERS): fall back to single bans */
+  missingPermissions: boolean;
   error?: string;
 }
 
 /**
  * Ban up to 200 users in a guild with a single request (POST /guilds/{id}/bulk-ban).
- * Requires the bot to have both BAN_MEMBERS and MANAGE_GUILD.
+ * Requires the bot to have both BAN_MEMBERS and MANAGE_GUILD; without them the result says
+ * `missingPermissions` and the caller falls back to banUser.
  * Users that are already banned or cannot be banned end up in `failed`.
  */
 export async function bulkBanUsers(
@@ -658,21 +683,27 @@ export async function bulkBanUsers(
       banned: data.banned_users || [],
       failed: data.failed_users || [],
       guildGone: false,
+      missingPermissions: false,
     };
   }
 
   const err = await readDiscordError(response);
+  const base = { banned: [], failed: [...userIds], guildGone: false, missingPermissions: false };
 
   // Discord answers 500000 when none of the users could be banned (e.g. all already banned)
   if (err.code === DiscordErrorCode.FAILED_TO_BAN_USERS) {
-    return { banned: [], failed: [...userIds], guildGone: false };
+    return base;
   }
 
   if (isGuildGoneError(err)) {
-    return { banned: [], failed: [...userIds], guildGone: true };
+    return { ...base, guildGone: true };
   }
 
-  return { banned: [], failed: [...userIds], guildGone: false, error: describeDiscordError(err) };
+  if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) {
+    return { ...base, missingPermissions: true };
+  }
+
+  return { ...base, error: describeDiscordError(err) };
 }
 
 export interface GuildBanPage {

@@ -230,7 +230,8 @@ Use this regularly to ensure global bans are properly enforced!
 
 ## Rate Limiting and Cloudflare Limits
 
-- **Global bans**: one bulk ban request per server and 200 users (`POST /guilds/{id}/bulk-ban`)
+- **Global bans**: one bulk ban request per server and 200 users (`POST /guilds/{id}/bulk-ban`, needs
+  Manage Server); servers without Manage Server automatically get single bans (Ban Members is enough)
 - **Large jobs**: processed by the BanJob Durable Object in runs of ~40 subrequests; the original
   message shows progress and is replaced by the result
 - **Ban checks**: one request per server and 1000 bans, read page by page across batches
@@ -248,7 +249,8 @@ Common error messages:
 | "No servers have global bans enabled" | No servers opted in | Use `/toggleglobalban` in servers |
 | "No log channel configured" | Log channel not set | Use `/setlogchannel` to set one |
 | "Bot not in server" | Bot removed from server | Bot auto-disables global bans for that server |
-| "Missing permissions" | Bot lacks Ban Members or Manage Server | Grant both permissions (bulk ban needs both) |
+| "Missing permissions (bot needs Ban Members)" | Bot cannot ban in that server | Grant Ban Members |
+| "server(s) without the Manage Server permission" | Info, not an error: bans ran one by one | Optional: grant Manage Server for faster bulk bans |
 | "Not banned (already banned, ...)" | User was already banned or outranks the bot | Usually nothing to do |
 | "Ban list too long (over 50000 bans)" | Server has an extremely long ban list | Check that server with `/checkbans server:<id>` |
 

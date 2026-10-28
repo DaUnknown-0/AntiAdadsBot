@@ -51,7 +51,9 @@ DISCORD_APPLICATION_ID=your_application_id
 npm run db:migrate
 ```
 
-7. Give the bot **Ban Members** and **Manage Server** in every server: the bulk ban endpoint requires both.
+7. Give the bot **Ban Members** in every server. **Manage Server** is optional: with it the bot bans up to
+   200 users per request (bulk ban); without it the bot falls back to banning one by one, which is slower
+   but gives the same result.
 
 ### Development
 

@@ -3,6 +3,7 @@ import type { Env } from '../types/env';
 import { DiscordEmbed } from '../types/discord';
 import {
   BULK_BAN_MAX_USERS,
+  banUser,
   bulkBanUsers,
   editOriginalResponse,
   fetchGuildBanPage,
@@ -64,6 +65,10 @@ interface WorkItem {
   /** Ban list pagination cursor (checks only) */
   after?: string;
   pages?: number;
+  /** Ban one by one (bot lacks Manage Server for the bulk ban endpoint) */
+  single?: boolean;
+  /** Cases created so far for a single-ban item, logged together when it is done */
+  cases?: Array<{ userId: string; caseNumber: number }>;
 }
 
 interface GuildOutcome {
@@ -91,6 +96,8 @@ interface JobState {
   totalGuilds: number;
   logChannels: Record<string, string | null> | null;
   outcomes: Record<string, GuildOutcome>;
+  /** Guilds where the bulk ban was refused for missing permissions */
+  singleBanGuilds?: string[];
   createdAt: number;
   runs: number;
   failedRuns: number;
@@ -102,6 +109,8 @@ const RUN_BUDGET = 40;
 const RUN_RESERVED = 2;
 const CONCURRENCY = 6;
 const UNBAN_USERS_PER_ITEM = 10;
+// Single bans per run and item: two such items (17 + case insert + log each) fit into one run
+const SINGLE_BANS_PER_RUN = 17;
 const MAX_ITEM_ATTEMPTS = 3;
 const MAX_FAILED_RUNS = 5;
 // 50 pages of 1000 bans; larger ban lists are reported as not checked
@@ -236,6 +245,10 @@ export class BanJob extends DurableObject<Env> {
     const hasLog = !!state.logChannels?.[item.guildId];
     switch (state.input.kind) {
       case 'ban':
+        if (this.usesSingleBans(state, item)) {
+          // one request per user + case insert + log message
+          return Math.min(item.userIds.length, SINGLE_BANS_PER_RUN) + 1 + (hasLog ? 1 : 0);
+        }
         // bulk-ban + case insert + log message
         return 2 + (hasLog ? 1 : 0);
       case 'unban':
@@ -264,7 +277,20 @@ export class BanJob extends DurableObject<Env> {
       }
 
       if (input.kind === 'ban') {
+        if (this.usesSingleBans(state, item)) {
+          item.single = true;
+          return await this.processSingleBans(state, item);
+        }
+
         const result = await bulkBanUsers(this.env, item.guildId, item.userIds, input.reason, input.deleteMessageSeconds);
+
+        if (result.missingPermissions) {
+          // Many servers do not grant Manage Server: ban one by one instead (needs only Ban Members)
+          state.singleBanGuilds ??= [];
+          if (!state.singleBanGuilds.includes(item.guildId)) state.singleBanGuilds.push(item.guildId);
+          item.single = true;
+          return true;
+        }
 
         if (result.guildGone) {
           outcome.error = GUILD_GONE_ERROR;
@@ -282,27 +308,8 @@ export class BanJob extends DurableObject<Env> {
         outcome.failedUserIds.push(...result.failed);
 
         // The ban itself succeeded: never retry from here on, or users would be banned twice
-        try {
-          const cases = await createModerationCases(this.env, {
-            guildId: item.guildId,
-            userIds: result.banned,
-            moderatorId: input.moderatorId,
-            actionType: 'ban',
-            reason: input.reason,
-          });
-
-          const channelId = state.logChannels?.[item.guildId];
-          if (channelId) {
-            await logBulkModerationAction(this.env, channelId, {
-              actionType: 'ban',
-              cases,
-              moderatorId: input.moderatorId,
-              reason: input.reason,
-            });
-          }
-        } catch (error) {
-          console.error(`Recording bans for guild ${item.guildId} failed:`, error);
-        }
+        const cases = await this.recordCases(state, item.guildId, result.banned);
+        await this.logBans(state, item.guildId, cases);
         return false;
       }
 
@@ -355,6 +362,93 @@ export class BanJob extends DurableObject<Env> {
       if (input.kind !== 'announce') outcome.failedUserIds.push(...item.userIds);
       return false;
     }
+  }
+
+  private usesSingleBans(state: JobState, item: WorkItem): boolean {
+    return !!item.single || !!state.singleBanGuilds?.includes(item.guildId);
+  }
+
+  /**
+   * Fallback without Manage Server: ban up to SINGLE_BANS_PER_RUN users of the item one by one,
+   * keep the rest for the next run, and log the whole item once it is done.
+   */
+  private async processSingleBans(state: JobState, item: WorkItem): Promise<boolean> {
+    const { input } = state;
+    const outcome = this.outcome(state, item.guildId);
+    const chunk = item.userIds.slice(0, SINGLE_BANS_PER_RUN);
+    const banned: string[] = [];
+    let processed = 0;
+    let hitLimit = false;
+    let stopGuild = false;
+
+    for (const userId of chunk) {
+      try {
+        const result = await banUser(this.env, item.guildId, userId, input.reason, input.deleteMessageSeconds);
+        processed++;
+        if (result.status === 'banned') {
+          banned.push(userId);
+        } else if (result.status === 'guild_gone' || result.status === 'missing_permissions') {
+          // Nothing else will work in this guild: fail the rest of the item
+          outcome.error = result.status === 'guild_gone' ? GUILD_GONE_ERROR : result.error;
+          outcome.failedUserIds.push(...item.userIds.slice(processed - 1));
+          if (result.status === 'guild_gone') await setGlobalBansDisabled(this.env, item.guildId);
+          stopGuild = true;
+          break;
+        } else {
+          outcome.error = result.error;
+          outcome.failedUserIds.push(userId);
+        }
+      } catch (error) {
+        if (isSubrequestLimitError(error)) {
+          hitLimit = true;
+          break;
+        }
+        processed++;
+        outcome.error = String((error as any)?.message || error);
+        outcome.failedUserIds.push(userId);
+      }
+    }
+
+    outcome.succeeded += banned.length;
+    (item.cases ??= []).push(...(await this.recordCases(state, item.guildId, banned)));
+    item.userIds = stopGuild ? [] : item.userIds.slice(processed);
+
+    if (hitLimit && ++item.attempts >= MAX_ITEM_ATTEMPTS) {
+      outcome.error = 'Cloudflare subrequest limit';
+      outcome.failedUserIds.push(...item.userIds);
+      item.userIds = [];
+    }
+
+    if (item.userIds.length > 0) return true;
+
+    await this.logBans(state, item.guildId, item.cases);
+    return false;
+  }
+
+  private async recordCases(state: JobState, guildId: string, userIds: string[]): Promise<Array<{ userId: string; caseNumber: number }>> {
+    try {
+      return await createModerationCases(this.env, {
+        guildId,
+        userIds,
+        moderatorId: state.input.moderatorId,
+        actionType: 'ban',
+        reason: state.input.reason,
+      });
+    } catch (error) {
+      console.error(`Recording bans for guild ${guildId} failed:`, error);
+      return [];
+    }
+  }
+
+  private async logBans(state: JobState, guildId: string, cases: Array<{ userId: string; caseNumber: number }>): Promise<void> {
+    const channelId = state.logChannels?.[guildId];
+    if (!channelId || cases.length === 0) return;
+    await logBulkModerationAction(this.env, channelId, {
+      actionType: 'ban',
+      cases,
+      moderatorId: state.input.moderatorId,
+      reason: state.input.reason,
+    });
   }
 
   /**
@@ -526,6 +620,9 @@ export class BanJob extends DurableObject<Env> {
 
     if (abortReason) message += `\n\n⚠️ ${abortReason}`;
     if (input.notes?.length) message += `\n\n${input.notes.join('\n')}`;
+    if (state.singleBanGuilds?.length) {
+      message += `\n\nℹ️ ${state.singleBanGuilds.length} server(s) without the Manage Server permission: users were banned one by one (slower, same result).`;
+    }
 
     const failureLines: string[] = [];
     for (const [guildId, o] of outcomes) {
