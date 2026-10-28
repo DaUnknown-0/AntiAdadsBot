@@ -69,6 +69,8 @@ interface WorkItem {
   single?: boolean;
   /** Cases created so far for a single-ban item, logged together when it is done */
   cases?: Array<{ userId: string; caseNumber: number }>;
+  /** How often Discord rate limited this item so far */
+  rateLimits?: number;
 }
 
 interface GuildOutcome {
@@ -113,6 +115,10 @@ const UNBAN_USERS_PER_ITEM = 10;
 const SINGLE_BANS_PER_RUN = 17;
 const MAX_ITEM_ATTEMPTS = 3;
 const MAX_FAILED_RUNS = 5;
+// A rate limited item goes back into the queue and the next run waits for Discord's retry-after
+const MAX_RATE_LIMIT_RETRIES = 6;
+const DEFAULT_RATE_LIMIT_WAIT_MS = 5_000;
+const MAX_RATE_LIMIT_WAIT_MS = 10 * 60 * 1000;
 // 50 pages of 1000 bans; larger ban lists are reported as not checked
 const MAX_CHECK_PAGES = 50;
 // Give Discord time to register the deferred response before the first edit
@@ -128,6 +134,8 @@ const missingKey = (guildId: string) => `check:missing:${guildId}`;
 export class BanJob extends DurableObject<Env> {
   /** Users a check compares against, loaded once per alarm run */
   private checkTargets: string[] | null = null;
+  /** Longest rate limit wait requested during the current alarm run */
+  private nextRunDelayMs = 0;
 
   async start(input: BanJobInput): Promise<void> {
     const queue: WorkItem[] = [];
@@ -180,6 +188,7 @@ export class BanJob extends DurableObject<Env> {
     if (!state) return;
 
     state.runs++;
+    this.nextRunDelayMs = 0;
 
     try {
       let budget = RUN_BUDGET - RUN_RESERVED;
@@ -217,7 +226,7 @@ export class BanJob extends DurableObject<Env> {
 
       if (state.queue.length > 0) {
         await this.ctx.storage.put('state', state);
-        await this.ctx.storage.setAlarm(Date.now() + NEXT_RUN_DELAY_MS);
+        await this.ctx.storage.setAlarm(Date.now() + Math.max(NEXT_RUN_DELAY_MS, this.nextRunDelayMs));
         await this.reportProgress(state);
         return;
       }
@@ -298,6 +307,13 @@ export class BanJob extends DurableObject<Env> {
           await setGlobalBansDisabled(this.env, item.guildId);
           return false;
         }
+        if (result.rateLimited) {
+          // Nobody was banned: try the whole item again once Discord allows it
+          if (this.deferForRateLimit(item, result.rateLimited.retryAfterMs)) return true;
+          outcome.error = result.error;
+          outcome.failedUserIds.push(...item.userIds);
+          return false;
+        }
         if (result.error) {
           outcome.error = result.error;
           outcome.failedUserIds.push(...result.failed);
@@ -324,6 +340,13 @@ export class BanJob extends DurableObject<Env> {
               outcome.error = GUILD_GONE_ERROR;
               outcome.failedUserIds.push(...item.userIds.slice(i));
               await setGlobalBansDisabled(this.env, item.guildId);
+              return false;
+            } else if (result.status === 'rate_limited') {
+              // Keep the users that were not processed yet for a later run
+              item.userIds = item.userIds.slice(i);
+              if (this.deferForRateLimit(item, result.retryAfterMs)) return true;
+              outcome.error = result.error;
+              outcome.failedUserIds.push(...item.userIds);
               return false;
             } else {
               outcome.error = result.error;
@@ -364,6 +387,20 @@ export class BanJob extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Discord still rate limits this item after the inline retries. Returns true if it should be
+   * requeued (the next run then waits for the retry-after), false once it was limited too often.
+   */
+  private deferForRateLimit(item: WorkItem, retryAfterMs?: number): boolean {
+    item.rateLimits = (item.rateLimits || 0) + 1;
+    if (item.rateLimits > MAX_RATE_LIMIT_RETRIES) return false;
+
+    const wait = Math.min(Math.max(retryAfterMs ?? DEFAULT_RATE_LIMIT_WAIT_MS, NEXT_RUN_DELAY_MS), MAX_RATE_LIMIT_WAIT_MS);
+    this.nextRunDelayMs = Math.max(this.nextRunDelayMs, wait);
+    console.warn(`BanJob: guild ${item.guildId} rate limited (${item.rateLimits}/${MAX_RATE_LIMIT_RETRIES}), next run in ${wait}ms`);
+    return true;
+  }
+
   private usesSingleBans(state: JobState, item: WorkItem): boolean {
     return !!item.single || !!state.singleBanGuilds?.includes(item.guildId);
   }
@@ -380,10 +417,16 @@ export class BanJob extends DurableObject<Env> {
     let processed = 0;
     let hitLimit = false;
     let stopGuild = false;
+    let rateLimited: { retryAfterMs?: number; error?: string } | null = null;
 
     for (const userId of chunk) {
       try {
         const result = await banUser(this.env, item.guildId, userId, input.reason, input.deleteMessageSeconds);
+        if (result.status === 'rate_limited') {
+          // This user was not banned: keep it and the rest for a later run
+          rateLimited = result;
+          break;
+        }
         processed++;
         if (result.status === 'banned') {
           banned.push(userId);
@@ -415,6 +458,12 @@ export class BanJob extends DurableObject<Env> {
 
     if (hitLimit && ++item.attempts >= MAX_ITEM_ATTEMPTS) {
       outcome.error = 'Cloudflare subrequest limit';
+      outcome.failedUserIds.push(...item.userIds);
+      item.userIds = [];
+    }
+
+    if (rateLimited && item.userIds.length > 0 && !this.deferForRateLimit(item, rateLimited.retryAfterMs)) {
+      outcome.error = rateLimited.error;
       outcome.failedUserIds.push(...item.userIds);
       item.userIds = [];
     }
@@ -503,9 +552,12 @@ export class BanJob extends DurableObject<Env> {
   private async reportProgress(state: JobState): Promise<void> {
     if (!this.canUseInteraction(state)) return;
 
-    const text = state.check
+    let text = state.check
       ? `${state.input.title}: ${state.check.checked.length + state.check.gone.length + state.check.unchecked.length}/${state.totalGuilds} servers checked...`
       : `${state.input.title}: ${state.totalItems - state.queue.length}/${state.totalItems} batches processed...`;
+    if (this.nextRunDelayMs > 3000) {
+      text += `\n\n⏳ Discord rate limit: continuing in ${Math.ceil(this.nextRunDelayMs / 1000)}s.`;
+    }
 
     const { applicationId, token } = state.input.interaction!;
     await editOriginalResponse(applicationId, token, {

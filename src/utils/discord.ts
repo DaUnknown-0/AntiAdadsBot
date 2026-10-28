@@ -123,6 +123,9 @@ export async function mapWithConcurrency<T, R>(
   return results;
 }
 
+// Longest 429 wait handled inside one request; longer ones are returned to the caller
+const MAX_INLINE_RETRY_WAIT_MS = 15_000;
+
 /**
  * Discord request with automatic handling of 429 rate limits.
  * Retries up to `maxRetries` times, waiting the server-specified retry-after if provided.
@@ -187,12 +190,19 @@ export async function discordRequestWithRetry(
       }
     }
 
-    console.warn(`Rate limited (429), waiting ${waitMs}ms before retry ${attempt}/${maxRetries}`);
+    // Long waits would block the whole invocation; hand the 429 back so a BanJob can
+    // reschedule the item for a later alarm run instead
+    if (waitMs > MAX_INLINE_RETRY_WAIT_MS) {
+      console.warn(`Rate limited (429) on ${endpoint}, retry after ${waitMs}ms is too long to wait inline`);
+      return res;
+    }
+
+    console.warn(`Rate limited (429) on ${endpoint}, waiting ${waitMs}ms before retry ${attempt}/${maxRetries}`);
     await sleep(waitMs);
   }
 }
 
-export type BanStatus = 'banned' | 'guild_gone' | 'missing_permissions' | 'error';
+export type BanStatus = 'banned' | 'guild_gone' | 'missing_permissions' | 'rate_limited' | 'error';
 
 /**
  * Ban a single user. Only needs BAN_MEMBERS, so it is the fallback for servers where the bot
@@ -204,7 +214,7 @@ export async function banUser(
   userId: string,
   reason?: string,
   deleteMessageSeconds?: number
-): Promise<{ status: BanStatus; error?: string }> {
+): Promise<{ status: BanStatus; error?: string; retryAfterMs?: number }> {
   const body: any = {};
   if (deleteMessageSeconds) {
     body.delete_message_seconds = Math.min(deleteMessageSeconds, 604800);
@@ -230,10 +240,11 @@ export async function banUser(
   const err = await readDiscordError(response);
   if (isGuildGoneError(err)) return { status: 'guild_gone' };
   if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) return { status: 'missing_permissions', error: describeDiscordError(err) };
+  if (err.status === 429) return { status: 'rate_limited', error: describeDiscordError(err), retryAfterMs: err.retryAfterMs };
   return { status: 'error', error: describeDiscordError(err) };
 }
 
-export type UnbanStatus = 'unbanned' | 'not_banned' | 'guild_gone' | 'error';
+export type UnbanStatus = 'unbanned' | 'not_banned' | 'guild_gone' | 'rate_limited' | 'error';
 
 /**
  * Unban a user from a guild
@@ -243,7 +254,7 @@ export async function unbanUser(
   guildId: string,
   userId: string,
   reason?: string
-): Promise<{ status: UnbanStatus; error?: string }> {
+): Promise<{ status: UnbanStatus; error?: string; retryAfterMs?: number }> {
   const response = await discordRequestWithRetry(
     env,
     `/guilds/${guildId}/bans/${userId}`,
@@ -263,6 +274,7 @@ export async function unbanUser(
   const err = await readDiscordError(response);
   if (err.code === DiscordErrorCode.UNKNOWN_BAN) return { status: 'not_banned' };
   if (isGuildGoneError(err)) return { status: 'guild_gone' };
+  if (err.status === 429) return { status: 'rate_limited', error: describeDiscordError(err), retryAfterMs: err.retryAfterMs };
   return { status: 'error', error: describeDiscordError(err) };
 }
 
@@ -596,6 +608,10 @@ export interface DiscordApiError {
   status: number;
   code?: number;
   message?: string;
+  /** 429 only: how long Discord asks us to wait */
+  retryAfterMs?: number;
+  /** 429 only: user, global or shared; missing when Cloudflare (not Discord) limited the request */
+  scope?: string;
 }
 
 /**
@@ -603,11 +619,21 @@ export interface DiscordApiError {
  */
 export async function readDiscordError(response: Response): Promise<DiscordApiError> {
   const text = await response.text().catch(() => '');
+  const err: DiscordApiError = { status: response.status };
+
+  if (response.status === 429) {
+    const retryAfter = parseFloat(response.headers.get('retry-after') || '');
+    if (!isNaN(retryAfter)) err.retryAfterMs = Math.ceil(retryAfter * 1000);
+    err.scope = response.headers.get('x-ratelimit-global') === 'true'
+      ? 'global'
+      : response.headers.get('x-ratelimit-scope') || undefined;
+  }
+
   try {
     const body: any = JSON.parse(text);
-    return { status: response.status, code: body?.code, message: body?.message };
+    return { ...err, code: body?.code, message: body?.message };
   } catch {
-    return { status: response.status, message: text.slice(0, 200) || undefined };
+    return { ...err, message: text.slice(0, 200) || undefined };
   }
 }
 
@@ -624,7 +650,10 @@ export function describeDiscordError(err: DiscordApiError): string {
     // Bulk bans fall back to single bans without Manage Server, so this means Ban Members is missing
     return 'Missing permissions (bot needs Ban Members)';
   }
-  if (err.status === 429) return 'Rate limited by Discord';
+  if (err.status === 429) {
+    const wait = err.retryAfterMs !== undefined ? `retry after ${Math.ceil(err.retryAfterMs / 1000)}s` : 'no retry time';
+    return `Rate limited by Discord (${wait}, scope ${err.scope || 'unknown'})`;
+  }
   return `HTTP ${err.status}${err.code ? ` (code ${err.code})` : ''}${err.message ? `: ${err.message}` : ''}`;
 }
 
@@ -643,6 +672,8 @@ export interface BulkBanResult {
   guildGone: boolean;
   /** The bot lacks MANAGE_GUILD (or BAN_MEMBERS): fall back to single bans */
   missingPermissions: boolean;
+  /** Still rate limited after the inline retries: nobody was banned, try again later */
+  rateLimited?: { retryAfterMs?: number };
   error?: string;
 }
 
@@ -703,6 +734,10 @@ export async function bulkBanUsers(
 
   if (err.code === DiscordErrorCode.MISSING_PERMISSIONS) {
     return { ...base, missingPermissions: true };
+  }
+
+  if (err.status === 429) {
+    return { ...base, rateLimited: { retryAfterMs: err.retryAfterMs }, error: describeDiscordError(err) };
   }
 
   return { ...base, error: describeDiscordError(err) };

@@ -7,6 +7,10 @@ compatibility_date = "2025-12-01"
 
 # Run the Worker close to its backend (D1) instead of close to Discord when that is faster.
 # Each slash command makes several sequential D1 round trips, so this can cut response time.
+# Keep logs (console output, e.g. Discord rate limits) in the dashboard; included in the free plan
+[observability]
+enabled = true
+
 [placement]
 mode = "smart"
 
