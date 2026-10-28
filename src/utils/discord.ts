@@ -36,9 +36,11 @@ async function discordRequest(
 ): Promise<Response> {
   const url = `${DISCORD_API_BASE}${endpoint}`;
 
+  // Only declare JSON when there is a body: Discord rejects an empty body sent as
+  // application/json with 50109 "invalid JSON" (this broke every unban)
   const headers: Record<string, string> = {
     Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-    'Content-Type': 'application/json',
+    ...(options.body !== undefined && options.body !== null ? { 'Content-Type': 'application/json' } : {}),
     ...(options.headers as Record<string, string> | undefined),
   };
 
