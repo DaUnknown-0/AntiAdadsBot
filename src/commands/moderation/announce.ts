@@ -55,7 +55,7 @@ export async function handleAnnounce(
         });
       } catch (error) {
         console.error('Error during announcement:', error);
-        await replyError(interaction, 'An error occurred while sending announcements.');
+        await replyError(interaction, error instanceof Error ? error.message : 'Could not start announcement.');
       }
     })()
   );

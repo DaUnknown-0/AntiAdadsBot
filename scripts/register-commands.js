@@ -16,6 +16,9 @@ if (!APPLICATION_ID || !BOT_TOKEN) {
 
 // Define all commands
 const commands = [
+  { name: 'job-status', description: 'Show a moderation job or the latest job', options: [{ name: 'id', description: 'Job ID (defaults to latest)', type: 3, required: false }] },
+  { name: 'cancel-job', description: 'Stop a moderation job after its current batch', options: [{ name: 'id', description: 'Job ID (defaults to latest)', type: 3, required: false }] },
+  { name: 'server-health', description: 'Check global-ban settings and bot permissions in this server' },
   {
     name: 'globalban',
     description: 'Globally ban a user across enabled servers',
@@ -155,6 +158,10 @@ const commands = [
   {
     name: 'listglobalbanservers',
     description: 'List all servers with global bans enabled',
+  },
+  {
+    name: 'check-servers',
+    description: 'Check all bot servers and list those with global bans disabled',
   },
   {
     name: 'announce',

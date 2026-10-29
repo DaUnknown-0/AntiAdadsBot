@@ -6,6 +6,7 @@ import { createErrorEmbed } from '../../utils/logging';
 import { addUsersToGlobalBanList, getGuildsWithGlobalBansEnabled } from '../../utils/databaseExtras';
 import { getInvokingUserId, isSpecialUser } from '../../utils/permissions';
 import { startBanJob } from '../../durable-objects/BanJob';
+import { validateJobSize } from '../../utils/jobLimits';
 
 /**
  * Shared helpers for the global ban commands
@@ -77,19 +78,19 @@ export async function runGlobalBan(
     const moderatorId = getInvokingUserId(interaction);
 
     // List update and guild lookup are independent, so run them in parallel
-    const [, guilds] = await Promise.all([
-      addUsersToGlobalBanList(env, userIds, reason, moderatorId, deleteMessageSeconds),
-      getGuildsWithGlobalBansEnabled(env),
-    ]);
+    const guilds = await getGuildsWithGlobalBansEnabled(env);
+    validateJobSize(guilds.map(() => ({ userIds })));
 
     const listNote = `Added ${userIds.length} user(s) to the global ban list.`;
 
     if (guilds.length === 0) {
+      await addUsersToGlobalBanList(env, userIds, reason, moderatorId, deleteMessageSeconds);
       await replyError(interaction, `${listNote}\n\nNo servers have global bans enabled, so nobody was banned.`);
       return;
     }
 
     await startBanJob(env, {
+      globalList: { action: 'add', userIds },
       kind: 'ban',
       title,
       targets: guilds.map(guildId => ({ guildId, userIds })),
@@ -101,6 +102,6 @@ export async function runGlobalBan(
     });
   } catch (error) {
     console.error(`Error starting ${title}:`, error);
-    await replyError(interaction, `An error occurred while starting the ${title.toLowerCase()}.`);
+    await replyError(interaction, error instanceof Error ? error.message : `Could not start ${title.toLowerCase()}.`);
   }
 }

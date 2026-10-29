@@ -25,19 +25,18 @@ export async function handleGlobalUnban(
   ctx.waitUntil(
     (async () => {
       try {
-        const [removedCount, guilds] = await Promise.all([
-          removeUserFromGlobalBanList(env, targetUserId),
-          getGuildsWithGlobalBansEnabled(env),
-        ]);
+        const guilds = await getGuildsWithGlobalBansEnabled(env);
 
-        const listNote = `Removed ${removedCount} record(s) from the global ban list.`;
+        const listNote = 'User removed from the global ban list.';
 
         if (guilds.length === 0) {
+          await removeUserFromGlobalBanList(env, targetUserId);
           await replyError(interaction, `${listNote}\n\nNo servers have global bans enabled, so nobody was unbanned.`);
           return;
         }
 
         await startBanJob(env, {
+          globalList: { action: 'remove', userIds: [targetUserId] },
           kind: 'unban',
           title: `Global unban for <@${targetUserId}>`,
           targets: guilds.map(guildId => ({ guildId, userIds: [targetUserId] })),
@@ -49,7 +48,7 @@ export async function handleGlobalUnban(
         });
       } catch (error) {
         console.error('Error during global unban:', error);
-        await replyError(interaction, 'An error occurred while performing the global unban.');
+        await replyError(interaction, error instanceof Error ? error.message : 'Could not start global unban.');
       }
     })()
   );

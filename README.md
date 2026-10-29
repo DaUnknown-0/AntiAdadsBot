@@ -10,6 +10,12 @@ A multi-server Discord moderation bot running on Cloudflare Workers with Durable
 - 🔨 Global bans across servers: bulk bans (200 users per request) processed by a Durable Object in batches
 - ⏰ Optional hourly global ban enforcement per server (`/toggleautoenforce`) via a native Cron Trigger
 - ✅ `/ping` command for quick health checks
+- `/check-servers`: privately lists bot servers with global bans disabled, including servers without configuration (SPECIAL_USER_IDS only). Long results are exported as a text file.
+- `/job-status [id]` retrieves the latest job or a specific job; results are retained for seven days.
+- `/cancel-job [id]` requests cancellation after the current batch. Completed moderation actions remain applied.
+- `/server-health` checks global-ban settings and bot permissions in the current server. These commands require SPECIAL_USER_IDS.
+
+Moderation jobs run one at a time. Requests are limited to 1,000 users, 200 servers and 10,000 user/server pairs; uploaded ID files are limited to 64 KiB. Split larger requests. Apply database migrations before deploying the updated Worker, then register commands with `node scripts/register-commands.js`.
 
 ## Setup
 

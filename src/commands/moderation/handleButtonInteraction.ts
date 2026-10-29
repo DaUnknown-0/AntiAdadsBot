@@ -53,8 +53,8 @@ async function handleEnforceBansButton(
 
   // Claim the pending action atomically so a double click cannot start two jobs
   const action = await env.DB.prepare(
-    `DELETE FROM pending_ban_actions WHERE id = ? AND expires_at > datetime('now') RETURNING user_ids, reason, delete_messages`
-  ).bind(actionId).first<{ user_ids: string; reason: string | null; delete_messages: number }>();
+    `UPDATE pending_ban_actions SET claim_until = ?, claim_token = ? WHERE id = ? AND expires_at > datetime('now') AND claim_until < ? RETURNING user_ids, reason, delete_messages`
+  ).bind(Date.now() + 60000, interaction.id, actionId, Date.now()).first<{ user_ids: string; reason: string | null; delete_messages: number }>();
 
   if (!action) {
     return {
@@ -83,6 +83,7 @@ async function handleEnforceBansButton(
         const byGuild = invertMissingBans(missingBans);
 
         await startBanJob(env, {
+          requestKey: `pending:${actionId}`,
           kind: 'ban',
           title: 'Ban enforcement',
           targets: [...byGuild.entries()].map(([guildId, userIds]) => ({ guildId, userIds })),
@@ -91,9 +92,11 @@ async function handleEnforceBansButton(
           moderatorId: invokingId,
           interaction: { applicationId: interaction.application_id, token: interaction.token },
         });
+        await env.DB.prepare('DELETE FROM pending_ban_actions WHERE id = ? AND claim_token = ?').bind(actionId, interaction.id).run();
       } catch (error) {
+        await env.DB.prepare('UPDATE pending_ban_actions SET claim_until = 0, claim_token = NULL WHERE id = ? AND claim_token = ?').bind(actionId, interaction.id).run();
         console.error('Error starting ban enforcement:', error);
-        await replyError(interaction, 'An error occurred while performing the bans.');
+        await replyError(interaction, error instanceof Error ? error.message : 'Could not start enforcement.');
       }
     })()
   );

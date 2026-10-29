@@ -1,6 +1,6 @@
 import { Env } from '../../types/env';
 import { DiscordInteraction, InteractionResponse, InteractionResponseType, MessageFlags } from '../../types/discord';
-import { getCurrentUserGuilds } from '../../utils/discord';
+import { editOriginalResponse, getCurrentUserGuilds } from '../../utils/discord';
 import { createErrorEmbed, createSuccessEmbed } from '../../utils/logging';
 import { getGuildsWithAutoEnforceEnabled, getGuildsWithGlobalBansEnabled } from '../../utils/databaseExtras';
 import { rejectUnlessSpecialUser } from './globalBanShared';
@@ -8,7 +8,20 @@ import { rejectUnlessSpecialUser } from './globalBanShared';
 export async function handleListGlobalBanServers(
   interaction: DiscordInteraction,
   env: Env,
-  _ctx: ExecutionContext
+  ctx: ExecutionContext
+): Promise<InteractionResponse> {
+  const rejection = rejectUnlessSpecialUser(env, interaction);
+  if (rejection) return rejection;
+  ctx.waitUntil((async () => {
+    const result = await buildServerList(interaction, env);
+    await editOriginalResponse(interaction.application_id, interaction.token, { embeds: result.data?.embeds });
+  })());
+  return { type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE, data: { flags: MessageFlags.EPHEMERAL } };
+}
+
+async function buildServerList(
+  interaction: DiscordInteraction,
+  env: Env
 ): Promise<InteractionResponse> {
   const rejection = rejectUnlessSpecialUser(env, interaction);
   if (rejection) return rejection;

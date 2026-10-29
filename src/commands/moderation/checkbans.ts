@@ -6,6 +6,8 @@ import { parseUserIds } from '../../utils/banCheck';
 import { getInvokingUserId } from '../../utils/permissions';
 import { startBanJob } from '../../durable-objects/BanJob';
 import { ephemeralError, rejectUnlessSpecialUser, replyError } from './globalBanShared';
+import { MAX_INPUT_BYTES, MAX_JOB_USERS } from '../../utils/jobLimits';
+import { readLimitedText } from '../../utils/input';
 
 export async function handleCheckBans(
   interaction: DiscordInteraction,
@@ -34,11 +36,13 @@ export async function handleCheckBans(
           const attachment = interaction.data.resolved.attachments[fileId];
           if (attachment && attachment.url) {
             try {
+              if (attachment.size > MAX_INPUT_BYTES) throw new Error('File exceeds 64 KiB.');
               const response = await fetch(attachment.url);
-              userIds = parseUserIds(await response.text());
+              if (!response.ok) { await response.body?.cancel(); throw new Error('Download failed.'); }
+              userIds = parseUserIds(await readLimitedText(response.body));
             } catch (err) {
               console.error('Error fetching attachment:', err);
-              await replyError(interaction, 'Failed to read the uploaded file.');
+              await replyError(interaction, err instanceof Error ? err.message : 'Failed to read the uploaded file.');
               return;
             }
           }
@@ -50,6 +54,7 @@ export async function handleCheckBans(
           await replyError(interaction, 'No valid user IDs found in the provided input.');
           return;
         }
+        if (userIds.length > MAX_JOB_USERS) throw new Error(`Maximum ${MAX_JOB_USERS} users per request.`);
 
         // Get guilds to check - either single server or all with global bans enabled
         const singleServer = serverId ? String(serverId).trim() : undefined;
@@ -72,7 +77,7 @@ export async function handleCheckBans(
         });
       } catch (error) {
         console.error('Error during ban check:', error);
-        await replyError(interaction, 'An error occurred while checking ban status.');
+        await replyError(interaction, error instanceof Error ? error.message : 'Could not check ban status.');
       }
     })()
   );

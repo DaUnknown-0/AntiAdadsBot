@@ -13,9 +13,10 @@ import {
   unbanUser,
 } from '../utils/discord';
 import { createModerationCases } from '../utils/database';
-import { createPendingBanAction, getGlobalBanGuildTargets, setGlobalBansDisabled } from '../utils/databaseExtras';
+import { addUsersToGlobalBanList, removeUserFromGlobalBanList, createPendingBanAction, getGlobalBanGuildTargets, setGlobalBansDisabled } from '../utils/databaseExtras';
 import { BanCheckVariant, buildBanCheckMessage } from '../utils/banCheck';
 import { createErrorEmbed, createInfoEmbed, createSuccessEmbed, logBulkModerationAction } from '../utils/logging';
+import { validateJobSize } from '../utils/jobLimits';
 
 /**
  * BanJob Durable Object
@@ -41,6 +42,9 @@ export interface BanCheckInput {
 }
 
 export interface BanJobInput {
+  requestKey?: string;
+  globalList?: { action: 'add' | 'remove'; userIds: string[] };
+  jobId?: string;
   kind: BanJobKind;
   /** Shown in the progress and result messages, e.g. "Global mass ban" */
   title: string;
@@ -59,6 +63,8 @@ export interface BanJobInput {
 }
 
 interface WorkItem {
+  userListKey?: string;
+  userCount?: number;
   guildId: string;
   userIds: string[];
   attempts: number;
@@ -108,7 +114,7 @@ interface JobState {
 // Subrequests (fetch + D1) one alarm run may use; the hard limit is 50
 const RUN_BUDGET = 40;
 // Reserved for the progress/result edit plus one D1 query (log channels or confirmation button)
-const RUN_RESERVED = 2;
+const RUN_RESERVED = 4;
 const CONCURRENCY = 6;
 const UNBAN_USERS_PER_ITEM = 10;
 // Single bans per run and item: two such items (17 + case insert + log each) fit into one run
@@ -138,7 +144,10 @@ export class BanJob extends DurableObject<Env> {
   private nextRunDelayMs = 0;
 
   async start(input: BanJobInput): Promise<void> {
+    validateJobSize(input.targets, input.check?.userIds);
+    if (new TextEncoder().encode(JSON.stringify(input)).byteLength > 1024 * 1024) throw new Error('Job input exceeds 1 MiB. Split the request.');
     const queue: WorkItem[] = [];
+    const lists = new Map<string, string>();
     const chunkSize = input.kind === 'unban' ? UNBAN_USERS_PER_ITEM : BULK_BAN_MAX_USERS;
 
     for (const target of input.targets) {
@@ -147,7 +156,15 @@ export class BanJob extends DurableObject<Env> {
         continue;
       }
       for (let i = 0; i < target.userIds.length; i += chunkSize) {
-        queue.push({ guildId: target.guildId, userIds: target.userIds.slice(i, i + chunkSize), attempts: 0 });
+        const users = target.userIds.slice(i, i + chunkSize);
+        const serialized = JSON.stringify(users);
+        let key = lists.get(serialized);
+        if (!key) {
+          key = `users:${lists.size}`;
+          lists.set(serialized, key);
+          await this.ctx.storage.put(key, users);
+        }
+        queue.push({ guildId: target.guildId, userIds: [], userListKey: key, userCount: users.length, attempts: 0 });
       }
     }
 
@@ -187,6 +204,16 @@ export class BanJob extends DurableObject<Env> {
     const state = await this.ctx.storage.get<JobState>('state');
     if (!state) return;
 
+    if (state.input.jobId) {
+      const job = await this.env.DB.prepare('SELECT status, lease_until FROM bot_jobs WHERE id = ?').bind(state.input.jobId).first<{ status: string; lease_until: number }>();
+      if (!job || job.status !== 'running' || job.lease_until < Date.now()) {
+        await this.finish(state, 'Job cancelled or lease expired.', 'cancelled');
+        return;
+      }
+      await this.env.DB.prepare('UPDATE bot_jobs SET updated_at = ?, lease_until = ? WHERE id = ? AND status = ?')
+        .bind(Date.now(), Date.now() + 7200000, state.input.jobId, 'running').run();
+    }
+
     state.runs++;
     this.nextRunDelayMs = 0;
 
@@ -218,11 +245,37 @@ export class BanJob extends DurableObject<Env> {
       }
 
       const requeue: WorkItem[] = [];
+      let storageFailure: unknown;
       await mapWithConcurrency(batch, CONCURRENCY, async (item) => {
-        const again = await this.processItem(state, item);
-        if (again) requeue.push(item);
+        let loaded = false;
+        try {
+          if (item.userListKey) {
+            const users = await this.ctx.storage.get<string[]>(item.userListKey);
+            if (!users) throw new Error('Missing stored user list');
+            item.userIds = users;
+          }
+          loaded = true;
+          const again = await this.processItem(state, item);
+          if (again) {
+            if (item.userListKey) {
+              // Each resumed item owns its remaining list; shared initial lists stay immutable.
+              item.userListKey = `remaining:${crypto.randomUUID()}`;
+              await this.ctx.storage.put(item.userListKey, item.userIds);
+              item.userCount = item.userIds.length;
+              item.userIds = [];
+            }
+            requeue.push(item);
+          }
+        } catch (error) {
+          // Keep the remaining users inline if persisting a resumed list failed.
+          // Wait for all workers before saving the recovered queue.
+          if (loaded) delete item.userListKey;
+          requeue.push(item);
+          storageFailure = error;
+        }
       });
       state.queue.unshift(...requeue);
+      if (storageFailure) throw storageFailure;
 
       if (state.queue.length > 0) {
         await this.ctx.storage.put('state', state);
@@ -256,12 +309,12 @@ export class BanJob extends DurableObject<Env> {
       case 'ban':
         if (this.usesSingleBans(state, item)) {
           // one request per user + case insert + log message
-          return Math.min(item.userIds.length, SINGLE_BANS_PER_RUN) + 1 + (hasLog ? 1 : 0);
+          return Math.min(item.userCount ?? item.userIds.length, SINGLE_BANS_PER_RUN) + 1 + (hasLog ? 1 : 0);
         }
         // bulk-ban + case insert + log message
         return 2 + (hasLog ? 1 : 0);
       case 'unban':
-        return item.userIds.length;
+        return item.userCount ?? item.userIds.length;
       case 'announce':
       case 'check':
         return 1;
@@ -550,7 +603,6 @@ export class BanJob extends DurableObject<Env> {
   }
 
   private async reportProgress(state: JobState): Promise<void> {
-    if (!this.canUseInteraction(state)) return;
 
     let text = state.check
       ? `${state.input.title}: ${state.check.checked.length + state.check.gone.length + state.check.unchecked.length}/${state.totalGuilds} servers checked...`
@@ -558,6 +610,11 @@ export class BanJob extends DurableObject<Env> {
     if (this.nextRunDelayMs > 3000) {
       text += `\n\n⏳ Discord rate limit: continuing in ${Math.ceil(this.nextRunDelayMs / 1000)}s.`;
     }
+    if (state.input.jobId) {
+      text += `\nJob ID: ${state.input.jobId}`;
+      await this.env.DB.prepare('UPDATE bot_jobs SET summary = ?, updated_at = ? WHERE id = ?').bind(text, Date.now(), state.input.jobId).run();
+    }
+    if (!this.canUseInteraction(state)) return;
 
     const { applicationId, token } = state.input.interaction!;
     await editOriginalResponse(applicationId, token, {
@@ -588,7 +645,10 @@ export class BanJob extends DurableObject<Env> {
       console.log(`${state.input.title}: ${summary} ${missingCount} missing bans.`);
 
       await this.ctx.storage.deleteAll();
-      if (missingCount === 0) return;
+      if (missingCount === 0) {
+        await this.saveResult(state, summary, 'completed');
+        return;
+      }
 
       await this.start({
         ...state.input,
@@ -634,10 +694,17 @@ export class BanJob extends DurableObject<Env> {
       }).catch(err => console.error('Result update failed:', err));
     }
 
+    await this.saveResult(state, message, 'completed');
     await this.ctx.storage.deleteAll();
   }
 
-  private async finish(state: JobState, abortReason?: string): Promise<void> {
+  private async saveResult(state: JobState, summary: string, status: string): Promise<void> {
+    if (!state.input.jobId) return;
+    await this.env.DB.prepare('UPDATE bot_jobs SET status = ?, summary = ?, updated_at = ?, lease_until = 0 WHERE id = ?')
+      .bind(status, summary.slice(0, 8000), Date.now(), state.input.jobId).run();
+  }
+
+  private async finish(state: JobState, abortReason?: string, status?: string): Promise<void> {
     const message = this.buildSummary(state, abortReason);
     console.log(`BanJob finished after ${state.runs} run(s): ${message.split('\n')[0]}`);
 
@@ -649,6 +716,7 @@ export class BanJob extends DurableObject<Env> {
       }).catch(err => console.error('Result update failed:', err));
     }
 
+    await this.saveResult(state, message, status || (abortReason ? 'failed' : 'completed'));
     await this.ctx.storage.deleteAll();
   }
 
@@ -670,7 +738,7 @@ export class BanJob extends DurableObject<Env> {
       message = `**${input.title} stopped.**`;
     }
 
-    if (abortReason) message += `\n\n⚠️ ${abortReason}`;
+    if (abortReason) message = message.replace(' complete.', ' stopped.') + `\n\n⚠️ ${abortReason}`;
     if (input.notes?.length) message += `\n\n${input.notes.join('\n')}`;
     if (state.singleBanGuilds?.length) {
       message += `\n\nℹ️ ${state.singleBanGuilds.length} server(s) without the Manage Server permission: users were banned one by one (slower, same result).`;
@@ -711,6 +779,34 @@ export class BanJob extends DurableObject<Env> {
  * Hand a job to a fresh BanJob instance. Costs one Durable Object request.
  */
 export async function startBanJob(env: Env, input: BanJobInput): Promise<void> {
-  const stub = env.BAN_JOBS.get(env.BAN_JOBS.newUniqueId());
-  await stub.start(input);
+  validateJobSize(input.targets, input.check?.userIds);
+  if (new TextEncoder().encode(JSON.stringify(input)).byteLength > 1024 * 1024) throw new Error('Job input exceeds 1 MiB. Split the request.');
+  const id = env.BAN_JOBS.newUniqueId();
+  const now = Date.now();
+  const key = input.requestKey || input.interaction?.token || null;
+  // Hash the interaction token; never persist credentials in the job index.
+  const digest = key ? await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key)) : null;
+  const requestKey = digest ? Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('') : null;
+  await env.DB.prepare("UPDATE bot_jobs SET status = 'failed', summary = 'Lease expired', updated_at = ? WHERE status IN ('running', 'cancel_requested') AND lease_until < ?").bind(now, now).run();
+  if (requestKey && await env.DB.prepare('SELECT id FROM bot_jobs WHERE request_key = ?').bind(requestKey).first()) return;
+  try {
+    await env.DB.prepare("INSERT INTO bot_jobs (id, request_key, title, moderator_id, status, created_at, updated_at, lease_until) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)")
+      .bind(id.toString(), requestKey, input.title, input.moderatorId, now, now, now + 7200000).run();
+  } catch (error) {
+    if (requestKey && await env.DB.prepare('SELECT id FROM bot_jobs WHERE request_key = ?').bind(requestKey).first()) return;
+    if (await env.DB.prepare("SELECT id FROM bot_jobs WHERE status IN ('running', 'cancel_requested')").first()) throw new Error('Another moderation job is running. Use /job-status and try again after it finishes.');
+    throw error;
+  }
+  try {
+    if (input.globalList?.action === 'add') await addUsersToGlobalBanList(env, input.globalList.userIds, input.reason, input.moderatorId, input.deleteMessageSeconds);
+    if (input.globalList?.action === 'remove') {
+      for (const userId of input.globalList.userIds) await removeUserFromGlobalBanList(env, userId);
+    }
+    const { globalList: _globalList, ...jobInput } = input;
+    await env.BAN_JOBS.get(id).start({ ...jobInput, jobId: id.toString() });
+    if (input.interaction) await editOriginalResponse(input.interaction.applicationId, input.interaction.token, { content: `Job started. ID: \`${id}\`\nUse /job-status to retrieve results.` }).catch(() => false);
+  } catch (error) {
+    await env.DB.prepare("UPDATE bot_jobs SET status = 'failed', summary = 'Could not start job', updated_at = ? WHERE id = ?").bind(Date.now(), id.toString()).run();
+    throw error;
+  }
 }

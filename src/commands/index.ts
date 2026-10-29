@@ -12,6 +12,8 @@ import { handleToggleGlobalBan, handleToggleAutoEnforce } from './moderation/tog
 import { handleSetLogChannel } from './moderation/setlogchannel';
 import { handleCheckBans } from './moderation/checkbans';
 import { handleListGlobalBanServers } from './moderation/listglobalbanservers';
+import { handleCheckServers } from './moderation/checkservers';
+import { handleJobCommand } from './moderation/jobs';
 import { handleAnnounce } from './moderation/announce';
 import { handleGlobalUnban } from './moderation/globalunban';
 import { handlePurgeGlobalBan } from './moderation/purgeglobalban';
@@ -77,6 +79,12 @@ export async function handleCommand(
         return await handleCheckBans(interaction, env, ctx);
       case 'listglobalbanservers':
         return await handleListGlobalBanServers(interaction, env, ctx);
+      case 'check-servers':
+        return await handleCheckServers(interaction, env, ctx);
+      case 'job-status':
+      case 'cancel-job':
+      case 'server-health':
+        return await handleJobCommand(interaction, env, ctx);
       case 'announce':
         return await handleAnnounce(interaction, env, ctx);
       case 'globalunban':

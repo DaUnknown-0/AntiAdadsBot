@@ -42,6 +42,7 @@ export class RateLimiter extends DurableObject {
     const body = await request.json() as { guildId: string; userId: string; timestamp: number };
     const key = `${body.guildId}:${body.userId}`;
     const now = body.timestamp;
+    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(now + 300000);
 
     // Get current rate limit data
     let entry: RateLimitEntry = await this.ctx.storage.get<RateLimitEntry>(key) || {
@@ -147,7 +148,8 @@ export class RateLimiter extends DurableObject {
       }
     }
 
-    // Schedule next cleanup in 5 minutes
-    await this.ctx.storage.setAlarm(now + 300000);
+    if ((await this.ctx.storage.list({ limit: 1 })).size > 0) {
+      await this.ctx.storage.setAlarm(now + 300000);
+    }
   }
 }

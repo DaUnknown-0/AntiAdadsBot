@@ -777,15 +777,24 @@ export async function fetchGuildBanPage(env: Env, guildId: string, after?: strin
  * List the guilds the bot is a member of (up to 200 per request, so one request for most bots)
  */
 export async function getCurrentUserGuilds(env: Env): Promise<Array<{ id: string; name: string }> | null> {
-  const response = await discordRequest(env, '/users/@me/guilds?limit=200');
-
-  if (!response.ok) {
-    // IMPORTANT: Always consume response body to prevent Cloudflare Workers deadlock
-    await response.text().catch(() => {});
-    return null;
+  const guilds: Array<{ id: string; name: string }> = [];
+  let after = '0';
+  // Leave room for response messages within the Free plan's external subrequest budget.
+  for (let page = 0; page < 40; page++) {
+    const response = await discordRequest(env, `/users/@me/guilds?limit=200&after=${after}`);
+    if (!response.ok) {
+      await response.text().catch(() => {});
+      return null;
+    }
+    const batch = await response.json() as Array<{ id: string; name: string }>;
+    guilds.push(...batch);
+    if (batch.length < 200) return guilds;
+    const lastId = batch[batch.length - 1].id;
+    if (lastId === after) return null;
+    after = lastId;
   }
-
-  return response.json();
+  // Never present a partial list as a complete audit.
+  return null;
 }
 
 /**

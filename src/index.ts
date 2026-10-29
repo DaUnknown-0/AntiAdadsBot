@@ -8,6 +8,8 @@ import { handleButtonInteraction } from './commands/moderation/handleButtonInter
 import { JsonResponse, ErrorResponse } from './utils/responses';
 import { getInvokingUserId, isSpecialUser } from './utils/permissions';
 import { addToGlobalBanListStatement, getGlobalBanList, getGuildsWithAutoEnforceEnabled } from './utils/databaseExtras';
+import { MAX_JOB_USERS } from './utils/jobLimits';
+import { readLimitedText } from './utils/input';
 
 // Export Durable Object classes
 export { RateLimiter, BanJob };
@@ -49,6 +51,12 @@ export default {
     // Read-only GET endpoints for third-party consumers
     if (request.method === 'GET' && (url.pathname === '/global-bans' || url.pathname === '/global-bans/users')) {
       if (!isReadOnly()) return ErrorResponse('unauthorized', 401);
+      for (const [key, minimum, maximum] of [['limit', 1, 500], ['offset', 0, 10000]] as const) {
+        const raw = url.searchParams.get(key);
+        if (raw !== null && (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) < minimum || Number(raw) > maximum)) {
+          return ErrorResponse(`invalid_${key}`, 400);
+        }
+      }
 
       if (url.pathname === '/global-bans/users') {
         const limit = Math.min(500, Number(url.searchParams.get('limit') || 100));
@@ -79,23 +87,29 @@ export default {
     const resultMatch = url.pathname.match(/^\/global-bans\/([^/]+)\/result$/);
     if (request.method === 'POST' && (url.pathname === '/global-bans' || resultMatch)) {
       if (!isAdmin()) return ErrorResponse('unauthorized', 401);
-      const body: any = await request.json().catch(() => null);
+      let rawBody: string;
+      try { rawBody = await readLimitedText(request.body); }
+      catch { return ErrorResponse('input_too_large_or_unreadable', 413); }
+      const body: any = (() => { try { return JSON.parse(rawBody); } catch { return null; } })();
       if (!body || typeof body !== 'object') return ErrorResponse('invalid_json', 400);
 
       if (url.pathname === '/global-bans') {
         const user_ids: unknown[] = Array.isArray(body.user_ids) ? body.user_ids : (body.user_id ? [body.user_id] : []);
         if (!user_ids.length) return ErrorResponse('missing_user_ids', 400);
+        if (user_ids.length > MAX_JOB_USERS) return ErrorResponse('too_many_users', 400);
         if (!user_ids.every(uid => typeof uid === 'string' && /^\d{15,21}$/.test(uid))) {
           return ErrorResponse('invalid_user_ids', 400);
         }
+        if (body.reason !== undefined && (typeof body.reason !== 'string' || body.reason.length > 512)) return ErrorResponse('invalid_reason', 400);
         const reason = body.reason || '';
         const del = Number(body.delete_messages) || 0;
+        if (!Number.isInteger(del) || del < 0 || del > 604800) return ErrorResponse('invalid_delete_messages', 400);
         const requested_by = body.requested_by || null;
         const created = new Date().toISOString();
         const inserted = (user_ids as string[]).map(uid => ({ id: crypto.randomUUID(), user_id: uid }));
-        const sql = `INSERT INTO global_bans (id, user_id, requested_by, reason, delete_messages, status, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)`;
-        // One batch counts as a single D1 query, however many users are inserted
-        await env.DB.batch(inserted.map(row => env.DB.prepare(sql).bind(row.id, row.user_id, requested_by, reason, del, created, created)));
+        await env.DB.prepare(`INSERT INTO global_bans (id, user_id, requested_by, reason, delete_messages, status, attempts, last_error, created_at, updated_at)
+          SELECT json_extract(value, '$.id'), json_extract(value, '$.user_id'), ?2, ?3, ?4, 'pending', 0, NULL, ?5, ?5 FROM json_each(?1)`)
+          .bind(JSON.stringify(inserted), requested_by, reason, del, created).run();
         return JsonResponse({ ids: inserted }, 201);
       }
 
@@ -255,6 +269,7 @@ async function enforceGlobalBans(env: Env): Promise<void> {
       getGuildsWithAutoEnforceEnabled(env),
       // Housekeeping: buttons older than an hour can no longer be used
       env.DB.prepare("DELETE FROM pending_ban_actions WHERE expires_at <= datetime('now')").run(),
+      env.DB.prepare("DELETE FROM bot_jobs WHERE status NOT IN ('running', 'cancel_requested') AND updated_at < ?").bind(Date.now() - 7 * 86400000).run(),
     ]);
 
     if (globalBans.length === 0 || guilds.length === 0) {

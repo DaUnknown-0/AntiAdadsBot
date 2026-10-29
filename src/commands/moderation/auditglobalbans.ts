@@ -50,7 +50,7 @@ export async function handleAuditGlobalBans(
         });
       } catch (error) {
         console.error('Error during global ban audit:', error);
-        await replyError(interaction, 'An error occurred while auditing global bans.');
+        await replyError(interaction, error instanceof Error ? error.message : 'Could not start audit.');
       }
     })()
   );

@@ -45,6 +45,10 @@ export const COMMAND_PERMISSIONS: Record<string, PermissionLevel> = {
   'toggleautoenforce': PermissionLevel.ADMIN,
   'checkbans': PermissionLevel.NONE,
   'listglobalbanservers': PermissionLevel.NONE,
+  'check-servers': PermissionLevel.NONE,
+  'job-status': PermissionLevel.NONE,
+  'cancel-job': PermissionLevel.NONE,
+  'server-health': PermissionLevel.NONE,
   'announce': PermissionLevel.NONE,
   'auditglobalbans': PermissionLevel.NONE,
 
@@ -139,6 +143,10 @@ export async function canRunCommand(
 
   // Base required level from default map
   let requiredLevel = COMMAND_PERMISSIONS[commandName] || PermissionLevel.NONE;
+  const globalCommands = new Set(['globalban', 'globalmassban', 'globalunban', 'purgeglobalban', 'checkbans', 'listglobalbanservers', 'check-servers', 'announce', 'auditglobalbans', 'exportglobalbans', 'job-status', 'cancel-job', 'server-health']);
+  if (globalCommands.has(commandName) && !isSpecialUser(env, userId)) {
+    return { allowed: false, userLevel: PermissionLevel.NONE, requiredLevel: PermissionLevel.OWNER };
+  }
 
   // Special users and server administrators pass every check, so skip the database
   if (isSpecialUser(env, userId) || hasAdministratorPermission(interaction.member)) {
